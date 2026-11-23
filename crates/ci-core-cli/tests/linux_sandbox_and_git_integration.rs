@@ -945,8 +945,17 @@ fn globset_link_header_www_authenticate_uname_and_openat2_materialization_work()
         ))
     );
 
-    // 4. `rustix::system::uname()` matches host architecture with zero subprocess fork.
-    verify_host_platform(Platform::LinuxAmd64).unwrap();
+    // 4. `rustix::system::uname()` matches host architecture with zero subprocess fork
+    // and fails closed on a mismatched target architecture.
+    #[cfg(target_arch = "x86_64")]
+    let (host_platform, other_platform) = (Platform::LinuxAmd64, Platform::LinuxArm64);
+    #[cfg(target_arch = "aarch64")]
+    let (host_platform, other_platform) = (Platform::LinuxArm64, Platform::LinuxAmd64);
+    verify_host_platform(host_platform).unwrap();
+    assert!(matches!(
+        verify_host_platform(other_platform),
+        Err(ci_core_cli::sandbox::SandboxError::ArchMismatch { .. })
+    ));
 
     // 5. `materialize_work_closure` writes files & symlinks via fd-relative `openat`/`symlinkat`
     // (exercising `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` on repeated parent opens).
