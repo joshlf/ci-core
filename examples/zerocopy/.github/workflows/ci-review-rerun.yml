@@ -1,0 +1,20 @@
+name: ci-core-review-rerun
+
+on:
+  workflow_run:
+    workflows:
+      - ci-core-review-signal
+    types:
+      - completed
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: read
+
+jobs:
+  review-rerun:
+    name: review-rerun
+    uses: joshlf/ci-core/.github/workflows/review-rerun.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    with:
+      config_path: ci/checks.toml

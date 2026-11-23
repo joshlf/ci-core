@@ -1,0 +1,679 @@
+name: ci-core
+
+on:
+  workflow_call:
+    inputs:
+      config_path:
+        description: Repository-relative path to declarative checks.toml
+        required: false
+        type: string
+        default: ci/checks.toml
+      shadow_mode:
+        description: Verify PR plan and reuse receipts offline without running PR compute shards
+        required: false
+        type: boolean
+        default: false
+      force_execute_all:
+        description: Bypass check receipt reuse and execute all active checks
+        required: false
+        type: boolean
+        default: false
+
+permissions: {}
+
+env:
+  # Release archive coordinates pinned atomically by Phase 2 of release.yml.
+  CORE_ARCHIVE_RELEASE_URL_X86_64: https://github.com/joshlf/ci-core/releases/download/v0.1.0-alpha.0/ci-core-x86_64-unknown-linux-musl.tar.zst
+  CORE_ARCHIVE_SHA256_X86_64: 0000000000000000000000000000000000000000000000000000000000000000
+  CORE_ARCHIVE_RELEASE_URL_AARCH64: https://github.com/joshlf/ci-core/releases/download/v0.1.0-alpha.0/ci-core-aarch64-unknown-linux-musl.tar.zst
+  CORE_ARCHIVE_SHA256_AARCH64: 0000000000000000000000000000000000000000000000000000000000000000
+  CORE_ARCHIVE_GHCR_REPO: joshlf/ci-core/release-archive
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read # Read workflow-run metadata and referenced workflows.
+      contents: read # Bare-fetch default branch and candidate commits.
+      packages: read # Probe existing attested GHCR image and check receipts.
+      pull-requests: read # Read live owner PR approvals for TCB changes.
+    outputs:
+      plan_sha256: ${{ steps.plan.outputs.plan_sha256 }}
+      plan_attempt: ${{ steps.plan.outputs.plan_attempt }}
+      mode: ${{ steps.plan.outputs.mode }}
+      has_images: ${{ steps.plan.outputs.has_images }}
+      has_checks: ${{ steps.plan.outputs.has_checks }}
+      needs_publish: ${{ steps.plan.outputs.needs_publish }}
+      image_matrix: ${{ steps.plan.outputs.image_matrix }}
+      execute_matrix: ${{ steps.plan.outputs.execute_matrix }}
+    steps:
+      - name: Bootstrap verified ci-core archive
+        id: bootstrap
+        shell: sh
+        run: |
+          set -eu
+          case "$(uname -m)" in
+            x86_64|amd64)
+              URL="$CORE_ARCHIVE_RELEASE_URL_X86_64"
+              SHA="$CORE_ARCHIVE_SHA256_X86_64"
+              ;;
+            aarch64|arm64)
+              URL="$CORE_ARCHIVE_RELEASE_URL_AARCH64"
+              SHA="$CORE_ARCHIVE_SHA256_AARCH64"
+              ;;
+            *)
+              echo "unsupported runner architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          BIN_DIR="$RUNNER_TEMP/ci-core/$SHA"
+          ARCHIVE="$RUNNER_TEMP/ci-core-$SHA.tar.zst"
+          mkdir -p "$BIN_DIR"
+          if ! curl -fsSL --retry 3 -o "$ARCHIVE" "$URL"; then
+            ANON_TOK="$(curl -fsSL "https://ghcr.io/token?service=ghcr.io&scope=repository:${CORE_ARCHIVE_GHCR_REPO}:pull" | jq -r '.token')"
+            REDIRECT_URL="$(curl -fsSI -H "Authorization: Bearer $ANON_TOK" "https://ghcr.io/v2/${CORE_ARCHIVE_GHCR_REPO}/blobs/sha256:${SHA}" | awk 'tolower($1)=="location:" {gsub("\r","",$2); print $2}')"
+            if [ -n "$REDIRECT_URL" ]; then
+              curl -fsSL --retry 3 -o "$ARCHIVE" "$REDIRECT_URL"
+            else
+              curl -fsSL --retry 3 -H "Authorization: Bearer $ANON_TOK" -o "$ARCHIVE" "https://ghcr.io/v2/${CORE_ARCHIVE_GHCR_REPO}/blobs/sha256:${SHA}"
+            fi
+          fi
+          printf '%s  %s\n' "$SHA" "$ARCHIVE" | sha256sum -c -
+          zstd -dc "$ARCHIVE" | tar -xf - -C "$BIN_DIR"
+          rm -f "$ARCHIVE"
+          chmod 0555 "$BIN_DIR/ci-core" "$BIN_DIR/bwrap"
+          printf 'bin_dir=%s\n' "$BIN_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Compute TCB and execution plan
+        id: plan
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CONFIG_PATH: ${{ inputs.config_path }}
+          SHADOW_MODE: ${{ inputs.shadow_mode }}
+          FORCE_EXECUTE_ALL: ${{ inputs.force_execute_all }}
+          EVENT_NAME: ${{ github.event_name }}
+          RUNTIME_REF: ${{ github.ref }}
+          BASE_REF: ${{ github.base_ref }}
+          EVENT_SHA: ${{ github.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MG_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          BIN_DIR: ${{ steps.bootstrap.outputs.bin_dir }}
+        run: |
+          set -euo pipefail
+          PLAN_OUT="$RUNNER_TEMP/plan-out"
+          mkdir -p "$PLAN_OUT"
+          ARGS=(
+            plan
+            --config "$CONFIG_PATH"
+            --event "$EVENT_NAME"
+            --runtime-ref "$RUNTIME_REF"
+            --event-sha "$EVENT_SHA"
+            --run-id "$RUN_ID"
+            --run-attempt "$RUN_ATTEMPT"
+            --bare-git-dir "$RUNNER_TEMP/ci-core-bare.git"
+            --out-dir "$PLAN_OUT"
+            --github-output "$GITHUB_OUTPUT"
+          )
+          if [[ "$SHADOW_MODE" == "true" ]]; then
+            ARGS+=(--shadow-mode)
+          fi
+          if [[ "$FORCE_EXECUTE_ALL" == "true" ]]; then
+            ARGS+=(--force-execute-all)
+          fi
+          if [[ -n "$BASE_REF" ]]; then
+            ARGS+=(--base-ref "$BASE_REF")
+          fi
+          if [[ -n "$PR_NUMBER" ]]; then
+            ARGS+=(--pr-number "$PR_NUMBER")
+          fi
+          if [[ -n "$PR_HEAD_SHA" ]]; then
+            ARGS+=(--pr-head-sha "$PR_HEAD_SHA")
+          fi
+          if [[ -n "$MG_BASE_SHA" ]]; then
+            ARGS+=(--merge-group-base-sha "$MG_BASE_SHA")
+          fi
+          "$BIN_DIR/ci-core" "${ARGS[@]}"
+          rm -rf "$RUNNER_TEMP/ci-core-bare.git"
+
+      # Obligation O3: omit retention-days on <150 KB metadata artifacts so orgs
+      # with <30-day retention caps never fail CreateArtifact with HTTP 400.
+      - name: Upload plan metadata artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: plan-a${{ github.run_attempt }}
+          path: ${{ runner.temp }}/plan-out
+          if-no-files-found: error
+          overwrite: false
+
+  build-images:
+    name: build-image (${{ matrix.recipe16 }})
+    needs: [plan]
+    if: needs.plan.outputs.mode != 'shadow-pr' && needs.plan.outputs.has_images == 'true'
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.image_matrix) }}
+    steps:
+      - name: Bootstrap verified ci-core archive
+        id: bootstrap
+        shell: sh
+        run: |
+          set -eu
+          case "$(uname -m)" in
+            x86_64|amd64)
+              URL="$CORE_ARCHIVE_RELEASE_URL_X86_64"
+              SHA="$CORE_ARCHIVE_SHA256_X86_64"
+              ;;
+            aarch64|arm64)
+              URL="$CORE_ARCHIVE_RELEASE_URL_AARCH64"
+              SHA="$CORE_ARCHIVE_SHA256_AARCH64"
+              ;;
+            *)
+              echo "unsupported runner architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          BIN_DIR="$RUNNER_TEMP/ci-core/$SHA"
+          ARCHIVE="$RUNNER_TEMP/ci-core-$SHA.tar.zst"
+          mkdir -p "$BIN_DIR"
+          if ! curl -fsSL --retry 3 -o "$ARCHIVE" "$URL"; then
+            ANON_TOK="$(curl -fsSL "https://ghcr.io/token?service=ghcr.io&scope=repository:${CORE_ARCHIVE_GHCR_REPO}:pull" | jq -r '.token')"
+            REDIRECT_URL="$(curl -fsSI -H "Authorization: Bearer $ANON_TOK" "https://ghcr.io/v2/${CORE_ARCHIVE_GHCR_REPO}/blobs/sha256:${SHA}" | awk 'tolower($1)=="location:" {gsub("\r","",$2); print $2}')"
+            if [ -n "$REDIRECT_URL" ]; then
+              curl -fsSL --retry 3 -o "$ARCHIVE" "$REDIRECT_URL"
+            else
+              curl -fsSL --retry 3 -H "Authorization: Bearer $ANON_TOK" -o "$ARCHIVE" "https://ghcr.io/v2/${CORE_ARCHIVE_GHCR_REPO}/blobs/sha256:${SHA}"
+            fi
+          fi
+          printf '%s  %s\n' "$SHA" "$ARCHIVE" | sha256sum -c -
+          zstd -dc "$ARCHIVE" | tar -xf - -C "$BIN_DIR"
+          rm -f "$ARCHIVE"
+          chmod 0555 "$BIN_DIR/ci-core" "$BIN_DIR/bwrap"
+          printf 'bin_dir=%s\n' "$BIN_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Download plan metadata
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: plan-a${{ needs.plan.outputs.plan_attempt }}
+          path: ${{ runner.temp }}/plan-in
+
+      - name: Build single-platform pure OCI image layout
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CONFIG_PATH: ${{ inputs.config_path }}
+          RECIPE_DIGEST: ${{ matrix.recipe }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          BIN_DIR: ${{ steps.bootstrap.outputs.bin_dir }}
+        run: |
+          set -euo pipefail
+          if [[ "${RUNNER_ENVIRONMENT:-}" == "github-hosted" ]] && command -v sudo >/dev/null 2>&1; then
+            AVAIL_MB="$(df -BM --output=avail "$RUNNER_TEMP" | tail -n 1 | tr -dc '0-9')"
+            if [[ -n "$AVAIL_MB" && "$AVAIL_MB" -lt 32768 ]]; then
+              sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet
+            fi
+          fi
+          "$BIN_DIR/ci-core" build-image \
+            --config "$CONFIG_PATH" \
+            --plan-dir "$RUNNER_TEMP/plan-in" \
+            --recipe "$RECIPE_DIGEST" \
+            --run-attempt "$RUN_ATTEMPT" \
+            --bare-git-dir "$RUNNER_TEMP/ci-core-bare.git" \
+            --out-meta-dir "$RUNNER_TEMP/img-meta-out" \
+            --out-blob-dir "$RUNNER_TEMP/img-blob-out"
+          rm -rf "$RUNNER_TEMP/ci-core-bare.git"
+
+      - name: Upload image metadata artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: img-meta-a${{ github.run_attempt }}-${{ matrix.recipe16 }}
+          path: ${{ runner.temp }}/img-meta-out
+          if-no-files-found: error
+          overwrite: false
+
+      - name: Upload image OCI layout blob
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: img-blob-a${{ github.run_attempt }}-${{ matrix.recipe16 }}
+          path: ${{ runner.temp }}/img-blob-out
+          retention-days: 1
+          if-no-files-found: error
+          overwrite: false
+
+      - name: Clean local image staging blobs
+        if: always()
+        shell: sh
+        run: rm -rf "$RUNNER_TEMP/img-meta-out" "$RUNNER_TEMP/img-blob-out"
+
+  execute:
+    name: execute (shard ${{ matrix.shard_index }})
+    needs: [plan, build-images]
+    if: >-
+      !cancelled() &&
+      needs.plan.outputs.mode != 'shadow-pr' &&
+      (needs.build-images.result == 'success' || needs.build-images.result == 'skipped') &&
+      needs.plan.outputs.has_checks == 'true'
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read # Bare-fetch declared source closures for scheduled checks.
+      packages: read # Pull attested GHCR OCI images and cache slots.
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.execute_matrix) }}
+    steps:
+      - name: Bootstrap verified ci-core archive
+        id: bootstrap
+        shell: sh
+        run: |
+          set -eu
+          case "$(uname -m)" in
+            x86_64|amd64)
+              URL="$CORE_ARCHIVE_RELEASE_URL_X86_64"
+              SHA="$CORE_ARCHIVE_SHA256_X86_64"
+              ;;
+            aarch64|arm64)
+              URL="$CORE_ARCHIVE_RELEASE_URL_AARCH64"
+              SHA="$CORE_ARCHIVE_SHA256_AARCH64"
+              ;;
+            *)
+              echo "unsupported runner architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          BIN_DIR="$RUNNER_TEMP/ci-core/$SHA"
+          ARCHIVE="$RUNNER_TEMP/ci-core-$SHA.tar.zst"
+          mkdir -p "$BIN_DIR"
+          if ! curl -fsSL --retry 3 -o "$ARCHIVE" "$URL"; then
+            ANON_TOK="$(curl -fsSL "https://ghcr.io/token?service=ghcr.io&scope=repository:${CORE_ARCHIVE_GHCR_REPO}:pull" | jq -r '.token')"
+            REDIRECT_URL="$(curl -fsSI -H "Authorization: Bearer $ANON_TOK" "https://ghcr.io/v2/${CORE_ARCHIVE_GHCR_REPO}/blobs/sha256:${SHA}" | awk 'tolower($1)=="location:" {gsub("\r","",$2); print $2}')"
+            if [ -n "$REDIRECT_URL" ]; then
+              curl -fsSL --retry 3 -o "$ARCHIVE" "$REDIRECT_URL"
+            else
+              curl -fsSL --retry 3 -H "Authorization: Bearer $ANON_TOK" -o "$ARCHIVE" "https://ghcr.io/v2/${CORE_ARCHIVE_GHCR_REPO}/blobs/sha256:${SHA}"
+            fi
+          fi
+          printf '%s  %s\n' "$SHA" "$ARCHIVE" | sha256sum -c -
+          zstd -dc "$ARCHIVE" | tar -xf - -C "$BIN_DIR"
+          rm -f "$ARCHIVE"
+          chmod 0555 "$BIN_DIR/ci-core" "$BIN_DIR/bwrap"
+          printf 'bin_dir=%s\n' "$BIN_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure unprivileged user namespaces for nested_bwrap
+        if: matrix.needs_bwrap == true
+        shell: sh
+        env:
+          BIN_DIR: ${{ steps.bootstrap.outputs.bin_dir }}
+        run: |
+          set -eu
+          if ! "$BIN_DIR/bwrap" --ro-bind / / --unshare-all --cap-drop ALL -- true 2>/dev/null; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            "$BIN_DIR/bwrap" --ro-bind / / --unshare-all --cap-drop ALL -- true
+          fi
+
+      - name: Download plan metadata
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: plan-a${{ needs.plan.outputs.plan_attempt }}
+          path: ${{ runner.temp }}/plan-in
+
+      - name: Download image metadata records
+        if: needs.plan.outputs.has_images == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: img-meta-*
+          merge-multiple: false
+          path: ${{ runner.temp }}/img-meta-in
+
+      - name: Resolve winning image OCI layout artifact
+        id: resolve_img
+        if: matrix.image_pending == true
+        shell: sh
+        env:
+          BIN_DIR: ${{ steps.bootstrap.outputs.bin_dir }}
+          PLAN_SHA256: ${{ needs.plan.outputs.plan_sha256 }}
+          SHARD_INDEX: ${{ matrix.shard_index }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/img-meta-in"
+          "$BIN_DIR/ci-core" resolve-image-blob \
+            --plan-dir "$RUNNER_TEMP/plan-in" \
+            --expected-plan-sha256 "$PLAN_SHA256" \
+            --img-meta-root "$RUNNER_TEMP/img-meta-in" \
+            --shard-index "$SHARD_INDEX" \
+            --run-attempt "$RUN_ATTEMPT" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Download winning image OCI layout blob
+        if: matrix.image_pending == true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ steps.resolve_img.outputs.img_blob_artifact }}
+          path: ${{ runner.temp }}/img-blob-in
+
+      - name: Execute sandboxed check shard
+        id: exec
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_CORE_BWRAP_BIN: ${{ steps.bootstrap.outputs.bin_dir }}/bwrap
+          CONFIG_PATH: ${{ inputs.config_path }}
+          PLAN_SHA256: ${{ needs.plan.outputs.plan_sha256 }}
+          SHARD_INDEX: ${{ matrix.shard_index }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          IMAGE_PENDING: ${{ matrix.image_pending }}
+          BIN_DIR: ${{ steps.bootstrap.outputs.bin_dir }}
+        run: |
+          set -euo pipefail
+          if [[ "${RUNNER_ENVIRONMENT:-}" == "github-hosted" ]] && command -v sudo >/dev/null 2>&1; then
+            AVAIL_MB="$(df -BM --output=avail "$RUNNER_TEMP" | tail -n 1 | tr -dc '0-9')"
+            if [[ -n "$AVAIL_MB" && "$AVAIL_MB" -lt 32768 ]]; then
+              sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet
+            fi
+          fi
+          mkdir -p "$RUNNER_TEMP/img-meta-in"
+          ARGS=(
+            execute
+            --config "$CONFIG_PATH"
+            --plan-dir "$RUNNER_TEMP/plan-in"
+            --expected-plan-sha256 "$PLAN_SHA256"
+            --img-meta-root "$RUNNER_TEMP/img-meta-in"
+            --shard-index "$SHARD_INDEX"
+            --run-attempt "$RUN_ATTEMPT"
+            --bare-git-dir "$RUNNER_TEMP/ci-core-bare.git"
+            --out-meta-dir "$RUNNER_TEMP/shard-meta-out"
+            --out-blob-dir "$RUNNER_TEMP/shard-blob-out"
+            --github-output "$GITHUB_OUTPUT"
+          )
+          if [[ "$IMAGE_PENDING" == "true" ]]; then
+            ARGS+=(--img-blob-dir "$RUNNER_TEMP/img-blob-in")
+          fi
+          "$BIN_DIR/ci-core" "${ARGS[@]}"
+          rm -rf "$RUNNER_TEMP/ci-core-bare.git" "$RUNNER_TEMP/img-blob-in"
+
+      - name: Upload shard metadata artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: shard-meta-a${{ github.run_attempt }}-${{ matrix.shard_index }}
+          path: ${{ runner.temp }}/shard-meta-out
+          if-no-files-found: error
+          overwrite: false
+
+      - name: Upload shard output and cache staging blobs
+        if: steps.exec.outputs.has_shard_blob == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: shard-blob-a${{ github.run_attempt }}-${{ matrix.shard_index }}
+          path: ${{ runner.temp }}/shard-blob-out
+          retention-days: 1
+          if-no-files-found: error
+          overwrite: false
+
+      - name: Clean local shard staging blobs
+        if: always()
+        shell: sh
+        run: rm -rf "$RUNNER_TEMP/shard-meta-out" "$RUNNER_TEMP/shard-blob-out" "$RUNNER_TEMP/img-blob-in"
+
+  publish:
+    name: publish
+    needs: [plan, build-images, execute]
+    if: >-
+      !cancelled() &&
+      needs.plan.outputs.needs_publish == 'true' &&
+      needs.plan.result == 'success' &&
+      (needs.build-images.result == 'success' || needs.build-images.result == 'skipped') &&
+      (needs.execute.result == 'success' || needs.execute.result == 'skipped')
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    timeout-minutes: 60
+    permissions:
+      actions: read # Re-verify workflow-run and job attempt metadata.
+      contents: read # Re-fetch live default-branch policy and candidate tree.
+      packages: write # Push verified OCI layouts and batch-signed Claim artifacts.
+      id-token: write # Mint keyless Sigstore Fulcio OIDC certificate.
+      pull-requests: read # Re-verify live owner PR approvals before signing.
+    steps:
+      - name: Bootstrap verified ci-core archive
+        id: bootstrap
+        timeout-minutes: 5
+        shell: sh
+        run: |
+          set -eu
+          case "$(uname -m)" in
+            x86_64|amd64)
+              URL="$CORE_ARCHIVE_RELEASE_URL_X86_64"
+              SHA="$CORE_ARCHIVE_SHA256_X86_64"
+              ;;
+            aarch64|arm64)
+              URL="$CORE_ARCHIVE_RELEASE_URL_AARCH64"
+              SHA="$CORE_ARCHIVE_SHA256_AARCH64"
+              ;;
+            *)
+              echo "unsupported runner architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          BIN_DIR="$RUNNER_TEMP/ci-core/$SHA"
+          ARCHIVE="$RUNNER_TEMP/ci-core-$SHA.tar.zst"
+          mkdir -p "$BIN_DIR"
+          if ! curl -fsSL --retry 3 -o "$ARCHIVE" "$URL"; then
+            ANON_TOK="$(curl -fsSL "https://ghcr.io/token?service=ghcr.io&scope=repository:${CORE_ARCHIVE_GHCR_REPO}:pull" | jq -r '.token')"
+            REDIRECT_URL="$(curl -fsSI -H "Authorization: Bearer $ANON_TOK" "https://ghcr.io/v2/${CORE_ARCHIVE_GHCR_REPO}/blobs/sha256:${SHA}" | awk 'tolower($1)=="location:" {gsub("\r","",$2); print $2}')"
+            if [ -n "$REDIRECT_URL" ]; then
+              curl -fsSL --retry 3 -o "$ARCHIVE" "$REDIRECT_URL"
+            else
+              curl -fsSL --retry 3 -H "Authorization: Bearer $ANON_TOK" -o "$ARCHIVE" "https://ghcr.io/v2/${CORE_ARCHIVE_GHCR_REPO}/blobs/sha256:${SHA}"
+            fi
+          fi
+          printf '%s  %s\n' "$SHA" "$ARCHIVE" | sha256sum -c -
+          zstd -dc "$ARCHIVE" | tar -xf - -C "$BIN_DIR"
+          rm -f "$ARCHIVE"
+          chmod 0555 "$BIN_DIR/ci-core" "$BIN_DIR/bwrap"
+          printf 'bin_dir=%s\n' "$BIN_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Download run metadata artifacts
+        timeout-minutes: 5
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: '{plan-a${{ needs.plan.outputs.plan_attempt }},img-meta-*,shard-meta-*}'
+          merge-multiple: false
+          path: ${{ runner.temp }}/meta-in
+
+      - name: Pre-verify, push blobs, sign batch Bundle0_3, and commit claims
+        timeout-minutes: 30
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CONFIG_PATH: ${{ inputs.config_path }}
+          PLAN_ATTEMPT: ${{ needs.plan.outputs.plan_attempt }}
+          PLAN_SHA256: ${{ needs.plan.outputs.plan_sha256 }}
+          SHADOW_MODE: ${{ inputs.shadow_mode }}
+          FORCE_EXECUTE_ALL: ${{ inputs.force_execute_all }}
+          EVENT_NAME: ${{ github.event_name }}
+          RUNTIME_REF: ${{ github.ref }}
+          BASE_REF: ${{ github.base_ref }}
+          EVENT_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          JOB_PLAN_RESULT: ${{ needs.plan.result }}
+          JOB_BI_RESULT: ${{ needs.build-images.result }}
+          JOB_EX_RESULT: ${{ needs.execute.result }}
+          BIN_DIR: ${{ steps.bootstrap.outputs.bin_dir }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/img-meta-only" "$RUNNER_TEMP/shard-meta-only"
+          shopt -s nullglob
+          for d in "$RUNNER_TEMP/meta-in"/img-meta-*; do
+            mv "$d" "$RUNNER_TEMP/img-meta-only/"
+          done
+          for d in "$RUNNER_TEMP/meta-in"/shard-meta-*; do
+            mv "$d" "$RUNNER_TEMP/shard-meta-only/"
+          done
+          shopt -u nullglob
+          ARGS=(
+            publish
+            --config "$CONFIG_PATH"
+            --plan-dir "$RUNNER_TEMP/meta-in/plan-a${PLAN_ATTEMPT}"
+            --expected-plan-sha256 "$PLAN_SHA256"
+            --img-meta-root "$RUNNER_TEMP/img-meta-only"
+            --shard-meta-root "$RUNNER_TEMP/shard-meta-only"
+            --run-id "$RUN_ID"
+            --run-attempt "$RUN_ATTEMPT"
+            --event "$EVENT_NAME"
+            --runtime-ref "$RUNTIME_REF"
+            --event-sha "$EVENT_SHA"
+            --job-plan-result "$JOB_PLAN_RESULT"
+            --job-build-images-result "$JOB_BI_RESULT"
+            --job-execute-result "$JOB_EX_RESULT"
+            --bare-git-dir "$RUNNER_TEMP/ci-core-bare.git"
+          )
+          if [[ "$SHADOW_MODE" == "true" ]]; then
+            ARGS+=(--shadow-mode)
+          fi
+          if [[ "$FORCE_EXECUTE_ALL" == "true" ]]; then
+            ARGS+=(--force-execute-all)
+          fi
+          if [[ -n "$BASE_REF" ]]; then
+            ARGS+=(--base-ref "$BASE_REF")
+          fi
+          "$BIN_DIR/ci-core" "${ARGS[@]}"
+          rm -rf "$RUNNER_TEMP/ci-core-bare.git"
+
+  gate:
+    name: gate
+    needs: [plan, build-images, execute, publish]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read # Verify run metadata and attempt alignment in evaluate_gate.
+      contents: read # Bare-fetch live default-branch policy and candidate tree.
+      pull-requests: read # Verify live owner PR approvals in evaluate_gate.
+    steps:
+      - name: Bootstrap verified ci-core archive
+        id: bootstrap
+        shell: sh
+        run: |
+          set -eu
+          case "$(uname -m)" in
+            x86_64|amd64)
+              URL="$CORE_ARCHIVE_RELEASE_URL_X86_64"
+              SHA="$CORE_ARCHIVE_SHA256_X86_64"
+              ;;
+            aarch64|arm64)
+              URL="$CORE_ARCHIVE_RELEASE_URL_AARCH64"
+              SHA="$CORE_ARCHIVE_SHA256_AARCH64"
+              ;;
+            *)
+              echo "unsupported runner architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          BIN_DIR="$RUNNER_TEMP/ci-core/$SHA"
+          ARCHIVE="$RUNNER_TEMP/ci-core-$SHA.tar.zst"
+          mkdir -p "$BIN_DIR"
+          if ! curl -fsSL --retry 3 -o "$ARCHIVE" "$URL"; then
+            ANON_TOK="$(curl -fsSL "https://ghcr.io/token?service=ghcr.io&scope=repository:${CORE_ARCHIVE_GHCR_REPO}:pull" | jq -r '.token')"
+            REDIRECT_URL="$(curl -fsSI -H "Authorization: Bearer $ANON_TOK" "https://ghcr.io/v2/${CORE_ARCHIVE_GHCR_REPO}/blobs/sha256:${SHA}" | awk 'tolower($1)=="location:" {gsub("\r","",$2); print $2}')"
+            if [ -n "$REDIRECT_URL" ]; then
+              curl -fsSL --retry 3 -o "$ARCHIVE" "$REDIRECT_URL"
+            else
+              curl -fsSL --retry 3 -H "Authorization: Bearer $ANON_TOK" -o "$ARCHIVE" "https://ghcr.io/v2/${CORE_ARCHIVE_GHCR_REPO}/blobs/sha256:${SHA}"
+            fi
+          fi
+          printf '%s  %s\n' "$SHA" "$ARCHIVE" | sha256sum -c -
+          zstd -dc "$ARCHIVE" | tar -xf - -C "$BIN_DIR"
+          rm -f "$ARCHIVE"
+          chmod 0555 "$BIN_DIR/ci-core" "$BIN_DIR/bwrap"
+          printf 'bin_dir=%s\n' "$BIN_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Download metadata artifacts
+        if: needs.plan.result == 'success'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: '{plan-a${{ needs.plan.outputs.plan_attempt }},img-meta-*,shard-meta-*}'
+          merge-multiple: false
+          path: ${{ runner.temp }}/meta-in
+
+      - name: Evaluate compile-time-offline FinalGate
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CONFIG_PATH: ${{ inputs.config_path }}
+          PLAN_ATTEMPT: ${{ needs.plan.outputs.plan_attempt }}
+          PLAN_SHA256: ${{ needs.plan.outputs.plan_sha256 }}
+          WORKFLOW_CANCELLED: ${{ cancelled() }}
+          SHADOW_MODE: ${{ inputs.shadow_mode }}
+          FORCE_EXECUTE_ALL: ${{ inputs.force_execute_all }}
+          EVENT_NAME: ${{ github.event_name }}
+          RUNTIME_REF: ${{ github.ref }}
+          BASE_REF: ${{ github.base_ref }}
+          EVENT_SHA: ${{ github.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          JOB_PLAN_RESULT: ${{ needs.plan.result }}
+          JOB_BI_RESULT: ${{ needs.build-images.result }}
+          JOB_EX_RESULT: ${{ needs.execute.result }}
+          JOB_PUB_RESULT: ${{ needs.publish.result }}
+          BIN_DIR: ${{ steps.bootstrap.outputs.bin_dir }}
+        run: |
+          set -euo pipefail
+          if [[ "$WORKFLOW_CANCELLED" == "true" ]]; then
+            echo "workflow was cancelled; failing closed" >&2
+            exit 1
+          fi
+          if [[ "$JOB_PLAN_RESULT" != "success" ]]; then
+            echo "plan job did not succeed ($JOB_PLAN_RESULT); failing closed" >&2
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/img-meta-only" "$RUNNER_TEMP/shard-meta-only"
+          shopt -s nullglob
+          for d in "$RUNNER_TEMP/meta-in"/img-meta-*; do
+            mv "$d" "$RUNNER_TEMP/img-meta-only/"
+          done
+          for d in "$RUNNER_TEMP/meta-in"/shard-meta-*; do
+            mv "$d" "$RUNNER_TEMP/shard-meta-only/"
+          done
+          shopt -u nullglob
+          ARGS=(
+            gate
+            --config "$CONFIG_PATH"
+            --plan-dir "$RUNNER_TEMP/meta-in/plan-a${PLAN_ATTEMPT}"
+            --expected-plan-sha256 "$PLAN_SHA256"
+            --img-meta-root "$RUNNER_TEMP/img-meta-only"
+            --shard-meta-root "$RUNNER_TEMP/shard-meta-only"
+            --run-id "$RUN_ID"
+            --run-attempt "$RUN_ATTEMPT"
+            --cancelled "$WORKFLOW_CANCELLED"
+            --event "$EVENT_NAME"
+            --runtime-ref "$RUNTIME_REF"
+            --event-sha "$EVENT_SHA"
+            --job-plan-result "$JOB_PLAN_RESULT"
+            --job-build-images-result "$JOB_BI_RESULT"
+            --job-execute-result "$JOB_EX_RESULT"
+            --job-publish-result "$JOB_PUB_RESULT"
+            --bare-git-dir "$RUNNER_TEMP/ci-core-bare.git"
+          )
+          if [[ "$SHADOW_MODE" == "true" ]]; then
+            ARGS+=(--shadow-mode)
+          fi
+          if [[ "$FORCE_EXECUTE_ALL" == "true" ]]; then
+            ARGS+=(--force-execute-all)
+          fi
+          if [[ -n "$BASE_REF" ]]; then
+            ARGS+=(--base-ref "$BASE_REF")
+          fi
+          if [[ -n "$PR_HEAD_SHA" ]]; then
+            ARGS+=(--pr-head-sha "$PR_HEAD_SHA")
+          fi
+          "$BIN_DIR/ci-core" "${ARGS[@]}"
+          rm -rf "$RUNNER_TEMP/ci-core-bare.git"

@@ -1,0 +1,9 @@
+error[E0451]: fields `canonical` and `oci_path` of struct `RepoSlug` are private
+ --> tests/ui/cannot_forge_repo_slug_oci_path.rs:5:9
+  |
+4 |     let _bad = RepoSlug {
+  |                -------- in this type
+5 |         canonical: "Google/Zerocopy".to_owned(),
+  |         ^^^^^^^^^ private field
+6 |         oci_path: "evil/path".to_owned(),
+  |         ^^^^^^^^ private field

@@ -1,0 +1,38 @@
+[package]
+name = "ci-core-model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64 = "0.23"
+globset = "0.4"
+hex = "0.4"
+regex = "1.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_json_canonicalizer = "0.4"
+serde_yaml_ng = "0.10"
+sha2 = "0.10"
+sigstore-crypto = "0.16.0"
+sigstore-types = "0.16.0"
+sigstore-verify = "0.16.0"
+thiserror = "2.0"
+toml = "0.8"
+
+[dev-dependencies]
+const-oid = "0.9"
+der = "0.7"
+jiff = "0.2"
+proptest = "1.6"
+sigstore-bundle = "0.16.0"
+sigstore-merkle = "0.16.0"
+sigstore-trust-root = "0.16.0"
+spki = "0.7"
+tls_codec = { version = "0.4", features = ["derive"] }
+trybuild = "1.0"
+x509-cert = { version = "0.2", features = ["sct"] }

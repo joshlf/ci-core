@@ -1,0 +1,16 @@
+error[E0423]: cannot initialize a tuple struct which contains private fields
+ --> tests/ui/cannot_construct_empty_nonempty_vec.rs:4:36
+  |
+4 |     let _empty: NonEmptyVec<u64> = NonEmptyVec(Vec::new());
+  |                                    ^^^^^^^^^^^
+  |
+  = note: a struct named `NonEmptyVec` exists in another namespace
+note: constructor is not visible here due to private fields
+ --> src/types.rs
+  |
+  | pub struct NonEmptyVec<T>(Vec<T>);
+  |                           ^^^^^^ private field
+help: you might have meant to use the `singleton` associated function
+  |
+4 |     let _empty: NonEmptyVec<u64> = NonEmptyVec::singleton(Vec::new());
+  |                                               +++++++++++

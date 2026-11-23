@@ -1,0 +1,14 @@
+name: ci-core-review-signal
+
+on:
+  pull_request_review:
+    types:
+      - submitted
+      - dismissed
+
+permissions: {}
+
+jobs:
+  review-signal:
+    name: review-signal
+    uses: joshlf/ci-core/.github/workflows/review-signal.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa

@@ -1,0 +1,211 @@
+name: release-ci-core
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (e.g. v0.1.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read # Default read-only checkout for build-archive jobs.
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build-archive:
+    name: build-archive (${{ matrix.rust_target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rust_target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - rust_target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout ci-core source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install musl toolchain and build static ci-core + bwrap
+        shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+          BWRAP_VERSION: 0.13.1
+          BWRAP_SHA256: 0e85c8702248b8dd64144f594147553650cdd0e4c951690345faace79c217c4d
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake musl-tools xz-utils zstd
+          rustup target add "$RUST_TARGET"
+          cargo test --workspace --locked
+          cargo build --release --locked --target "$RUST_TARGET" -p ci-core-cli
+
+          BWRAP_STAGE="$RUNNER_TEMP/bwrap-stage"
+          mkdir -p "$BWRAP_STAGE"
+          BWRAP_TAR="$BWRAP_STAGE/bubblewrap-${BWRAP_VERSION}.tar.xz"
+          curl -fsSL --retry 3 -o "$BWRAP_TAR" \
+            "https://github.com/containers/bubblewrap/releases/download/v${BWRAP_VERSION}/bubblewrap-${BWRAP_VERSION}.tar.xz"
+          printf '%s  %s\n' "$BWRAP_SHA256" "$BWRAP_TAR" | sha256sum -c -
+          docker run --rm \
+            -v "$BWRAP_STAGE:/stage:rw" \
+            docker.io/library/alpine:3.21@sha256:bc21487101ae47172509130ee1092cc273a831968d64b617776d1f69c81e42ab \
+            sh -ec "
+              apk add --no-cache build-base meson ninja linux-headers libcap-dev libcap-static xz
+              mkdir -p /tmp/bwrap-src
+              tar -xf /stage/bubblewrap-${BWRAP_VERSION}.tar.xz -C /tmp/bwrap-src --strip-components=1
+              meson setup /tmp/bwrap-build /tmp/bwrap-src \
+                -Dprefer_static=true -Dc_link_args=-static \
+                -Dselinux=disabled -Dbash_completion=disabled -Dzsh_completion=disabled -Dman=disabled -Dtests=false
+              ninja -C /tmp/bwrap-build
+              install -m 0755 /tmp/bwrap-build/bwrap /stage/bwrap
+            "
+
+          STAGE="$RUNNER_TEMP/archive-stage"
+          mkdir -p "$STAGE" "$RUNNER_TEMP/dist"
+          install -m 0555 "target/${RUST_TARGET}/release/ci-core" "$STAGE/ci-core"
+          install -m 0555 "$BWRAP_STAGE/bwrap" "$STAGE/bwrap"
+          tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+            -cf - -C "$STAGE" ci-core bwrap | zstd -19 -T0 -o "$RUNNER_TEMP/dist/ci-core-${RUST_TARGET}.tar.zst"
+          sha256sum "$RUNNER_TEMP/dist/ci-core-${RUST_TARGET}.tar.zst"
+
+      - name: Upload deterministic release archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dist-${{ matrix.rust_target }}
+          path: ${{ runner.temp }}/dist
+          if-no-files-found: error
+          overwrite: false
+
+  publish-and-pin:
+    name: publish-and-pin
+    needs: [build-archive]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # Create immutable GitHub Release and upload archives.
+      packages: write # Push fallback release archive blobs to GHCR.
+    steps:
+      - name: Checkout ci-core repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Download built archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: dist-*
+          merge-multiple: false
+          path: ${{ runner.temp }}/dist-all
+
+      - name: Publish GitHub Release assets and GHCR fallback blobs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+          TAG: ${{ inputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          X64="$RUNNER_TEMP/dist-all/dist-x86_64-unknown-linux-musl/ci-core-x86_64-unknown-linux-musl.tar.zst"
+          ARM="$RUNNER_TEMP/dist-all/dist-aarch64-unknown-linux-musl/ci-core-aarch64-unknown-linux-musl.tar.zst"
+          SHA_X64="$(sha256sum "$X64" | awk '{print $1}')"
+          SHA_ARM="$(sha256sum "$ARM" | awk '{print $1}')"
+          SIZE_X64="$(wc -c < "$X64" | tr -d ' ')"
+          SIZE_ARM="$(wc -c < "$ARM" | tr -d ' ')"
+
+          gh release create "$TAG" "$X64" "$ARM" --repo "$REPO" --title "$TAG" --notes "ci-core static musl release ($TAG)"
+
+          LOWER_REPO="$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
+          GHCR_REPO="${LOWER_REPO}/release-archive"
+          BASIC_B64="$(printf '%s:%s' "$ACTOR" "$GH_TOKEN" | base64 -w0)"
+          PUSH_TOK="$(curl -fsSL -H "Authorization: Basic $BASIC_B64" \
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:${GHCR_REPO}:pull,push" | jq -r '.token')"
+
+          upload_ghcr_blob() {
+            local file="$1" sha="$2"
+            local status
+            status="$(curl -sS -o /dev/null -w '%{http_code}' -I \
+              -H "Authorization: Bearer $PUSH_TOK" \
+              "https://ghcr.io/v2/${GHCR_REPO}/blobs/sha256:${sha}")"
+            if [ "$status" = "200" ]; then
+              return 0
+            fi
+            local loc
+            loc="$(curl -fsSI -X POST \
+              -H "Authorization: Bearer $PUSH_TOK" \
+              -H "Content-Length: 0" \
+              "https://ghcr.io/v2/${GHCR_REPO}/blobs/uploads/" \
+              | awk 'tolower($1)=="location:" {gsub("\r","",$2); print $2}')"
+            case "$loc" in
+              http*) ;;
+              /*) loc="https://ghcr.io${loc}" ;;
+            esac
+            local sep="?"
+            case "$loc" in *\?*) sep="&" ;; esac
+            curl -fsSL -X PUT \
+              -H "Authorization: Bearer $PUSH_TOK" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@${file}" \
+              "${loc}${sep}digest=sha256:${sha}" >/dev/null
+          }
+
+          EMPTY_CFG="$RUNNER_TEMP/empty-oci-config.json"
+          printf '{}' > "$EMPTY_CFG"
+          SHA_CFG="$(sha256sum "$EMPTY_CFG" | awk '{print $1}')"
+          upload_ghcr_blob "$EMPTY_CFG" "$SHA_CFG"
+          upload_ghcr_blob "$X64" "$SHA_X64"
+          upload_ghcr_blob "$ARM" "$SHA_ARM"
+
+          MANIFEST="$RUNNER_TEMP/release-manifest.json"
+          cat > "$MANIFEST" <<EOF
+          {
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+              "mediaType": "application/vnd.oci.empty.v1+json",
+              "digest": "sha256:${SHA_CFG}",
+              "size": 2
+            },
+            "layers": [
+              {
+                "mediaType": "application/zstd",
+                "digest": "sha256:${SHA_X64}",
+                "size": ${SIZE_X64},
+                "annotations": { "org.opencontainers.image.title": "ci-core-x86_64-unknown-linux-musl.tar.zst" }
+              },
+              {
+                "mediaType": "application/zstd",
+                "digest": "sha256:${SHA_ARM}",
+                "size": ${SIZE_ARM},
+                "annotations": { "org.opencontainers.image.title": "ci-core-aarch64-unknown-linux-musl.tar.zst" }
+              }
+            ],
+            "annotations": {
+              "org.opencontainers.image.source": "https://github.com/${REPO}"
+            }
+          }
+          EOF
+          curl -fsSL -X PUT \
+            -H "Authorization: Bearer $PUSH_TOK" \
+            -H "Content-Type: application/vnd.oci.image.manifest.v1+json" \
+            --data-binary "@${MANIFEST}" \
+            "https://ghcr.io/v2/${GHCR_REPO}/manifests/${TAG}" >/dev/null
+
+          URL_X64="https://github.com/${REPO}/releases/download/${TAG}/ci-core-x86_64-unknown-linux-musl.tar.zst"
+          URL_ARM="https://github.com/${REPO}/releases/download/${TAG}/ci-core-aarch64-unknown-linux-musl.tar.zst"
+          {
+            echo "### Release Archive Coordinates (${TAG})"
+            echo '```yaml'
+            echo "CORE_ARCHIVE_RELEASE_URL_X86_64: ${URL_X64}"
+            echo "CORE_ARCHIVE_SHA256_X86_64: ${SHA_X64}"
+            echo "CORE_ARCHIVE_RELEASE_URL_AARCH64: ${URL_ARM}"
+            echo "CORE_ARCHIVE_SHA256_AARCH64: ${SHA_ARM}"
+            echo "CORE_ARCHIVE_GHCR_REPO: ${GHCR_REPO}"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"

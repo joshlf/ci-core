@@ -1,0 +1,43 @@
+[package]
+name = "ci-core-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "ci_core_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ci-core"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+backon = { version = "1.6", default-features = false, features = ["std", "std-blocking-sleep"] }
+base64 = "0.23"
+ci-core-model = { path = "../ci-core-model" }
+clap = { version = "4.5", features = ["derive", "env"] }
+hex = "0.4"
+jiff = "0.2"
+reqwest = { version = "0.13", features = ["blocking", "json"] }
+rustix = { version = "1.0", features = ["fs", "process", "system"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+sigstore-sign = "0.16.0"
+sigstore-types = "0.16.0"
+tar = "0.4"
+tempfile = "3.19"
+thiserror = "2.0"
+tokio = { version = "1.44", features = ["rt-multi-thread"] }
+toml = "0.8"
+url = "2.5"
+zip = { version = "=9.7.3", default-features = false, features = ["deflate-flate2"] }
+zstd = "0.13"
+
+[dev-dependencies]
+proptest = "1.6"

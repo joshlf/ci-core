@@ -1,0 +1,175 @@
+schema_version = 1
+
+[repo]
+slug = "google/zerocopy"
+id = 534354967
+owner_id = 1342004
+default_branch = "main"
+sigstore = "public_good"
+trusted_engine_workflow = "joshlf/ci-core/.github/workflows/ci.yml"
+trusted_engine_shas = [
+  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+]
+
+[tcb]
+owner_user_ids = [1046063, 3820879, 1775176]
+allow_owner_self_approval = false
+review_signal_workflow = ".github/workflows/ci-review-signal.yml"
+review_rerun_workflow = ".github/workflows/ci-review-rerun.yml"
+non_tcb_workflows = ["scorecard.yml", "dependency-review.yml"]
+non_tcb_subtrees = ["evals", "skills", "zerocopy/vendor"]
+extra_executable_paths = [
+  ".github/scripts/**",
+  "ci/*.sh",
+  "ci/*.py",
+  "ci/scripts/**",
+  "anneal/ci/**",
+  "tools/*.sh",
+  "zerocopy/cargo.sh",
+  "zerocopy/ci/**",
+]
+
+[tcb.caller]
+kind = "repo_ruleset"
+caller_workflows = [
+  ".github/workflows/ci-core-pr.yml",
+  ".github/workflows/ci-core-trusted.yml",
+]
+gate_check_name = "ci-core / gate"
+codeowners = ["@joshlf", "@jswrenn", "@mdittmer"]
+
+[commit_policy]
+forbid_message_regex = '\bT[O]DO\b'
+
+[pins.kani-pin]
+path = "ci/pins/kani-pin.toml"
+keys = { tool_version = "[0-9]+\\.[0-9]+\\.[0-9]+", sha256 = "[0-9a-f]{64}" }
+
+[images.rust-main]
+dockerfile = "ci/docker/rust-main.Dockerfile"
+context = [{ kind = "glob", include = ["ci/docker/common/**"] }]
+pins = ["kani-pin"]
+build_args = { BASE_SUITE = "noble" }
+platform = "linux/amd64"
+runner = "ubuntu-24.04"
+
+[images.anneal-tc]
+dockerfile = "ci/docker/anneal-tc.Dockerfile"
+context = [{ kind = "glob", include = ["ci/docker/common/**"] }]
+pins = ["kani-pin"]
+platform = "linux/amd64"
+runner = "ubuntu-24.04"
+
+[caches.zerocopy-cargo-home]
+mount = "/cargo-home"
+scope = "cross_image"
+inputs = [{ kind = "glob", include = ["zerocopy/Cargo.lock"] }]
+cargo_locked = { workspace = "zerocopy/Cargo.toml" }
+
+[caches.anneal-cargo-home]
+mount = "/cargo-home"
+scope = "cross_image"
+inputs = [{ kind = "glob", include = ["anneal/Cargo.lock"] }]
+cargo_locked = { workspace = "anneal/Cargo.toml" }
+
+[caches.exocrate-cargo-home]
+mount = "/cargo-home"
+scope = "cross_image"
+inputs = [{ kind = "glob", include = ["exocrate/Cargo.lock"] }]
+cargo_locked = { workspace = "exocrate/Cargo.toml" }
+
+[caches.tools-cargo-home]
+mount = "/cargo-home"
+scope = "cross_image"
+inputs = [{ kind = "glob", include = ["tools/Cargo.lock"] }]
+cargo_locked = { workspace = "tools/Cargo.toml" }
+
+# Obligation O4: sharded read-write verifier caches bind SHARD_INDEX and
+# SHARD_TOTAL in env_keys so each shard owns a disjoint CacheKeyDigest.
+[caches.miri-v1]
+mount = "/ci-cache/miri"
+scope = "per_image"
+tier = "public_cas"
+inputs = [
+  { kind = "glob", include = ["anneal/flake.lock", "anneal/vendor/lean-miri/UPSTREAM_PIN.json"] },
+]
+env_keys = ["RUSTFLAGS", "SHARD_INDEX", "SHARD_TOTAL"]
+max_bytes = 2147483648
+
+[[checks]]
+id = "zerocopy-build-test"
+image = "rust-main"
+sandbox = "container"
+runner = "ubuntu-24.04"
+shard_group = "zc-build-${matrix.toolchain}"
+workdir = "zerocopy"
+inputs = [
+  { kind = "cargo_workspace", manifest_path = "zerocopy/Cargo.toml" },
+  { kind = "glob", include = ["zerocopy/cargo.sh", "zerocopy/ci/**", "zerocopy/testdata/**", "zerocopy/vendor/**"] },
+]
+command = ["./cargo.sh", "+${matrix.toolchain}", "test", "--features", "${matrix.profile}"]
+env = { CARGO_HOME = "/cargo-home", CARGO_NET_OFFLINE = "true", RUSTFLAGS = "-Dwarnings" }
+matrix = { toolchain = ["msrv", "stable", "nightly"], profile = ["default", "simd"] }
+matrix_exclude = [{ toolchain = "msrv", profile = "simd" }]
+caches = ["zerocopy-cargo-home"]
+
+[[checks]]
+id = "zerocopy-miri"
+image = "rust-main"
+sandbox = "container"
+runner = "ubuntu-24.04"
+workdir = "zerocopy"
+inputs = [
+  { kind = "cargo_workspace", manifest_path = "zerocopy/Cargo.toml" },
+  { kind = "glob", include = ["zerocopy/cargo.sh", ".github/scripts/run_miri_batched.sh", "zerocopy/vendor/**"] },
+]
+command = ["../.github/scripts/run_miri_batched.sh"]
+env = { CARGO_HOME = "/cargo-home", CARGO_NET_OFFLINE = "true", RUSTFLAGS = "-Zmiri-strict-provenance", SHARD_INDEX = "${matrix.shard}", SHARD_TOTAL = "2" }
+matrix = { shard = ["0", "1"] }
+events = ["merge_group", "push"]
+caches = ["zerocopy-cargo-home", "miri-v1"]
+
+[[checks]]
+id = "anneal-workspace-tests"
+image = "anneal-tc"
+sandbox = "nested_bwrap"
+runner = "ubuntu-24.04"
+workdir = "anneal"
+pins = ["kani-pin"]
+inputs = [
+  { kind = "cargo_workspace", manifest_path = "anneal/Cargo.toml" },
+  { kind = "glob", include = ["anneal/theory/**", "anneal/vendor/**", "anneal/flake.nix", "anneal/flake.lock", "anneal/ci/**"] },
+]
+command = ["ci/check_todo.sh"]
+env = { SHARD_INDEX = "${matrix.shard}", SHARD_TOTAL = "3", CARGO_HOME = "/cargo-home", CARGO_NET_OFFLINE = "true", RUSTFLAGS = "" }
+matrix = { shard = ["0", "1", "2"] }
+caches = ["anneal-cargo-home", "miri-v1"]
+outputs = [{ name = "lcov.info", max_bytes = 67108864 }]
+max_age_days = 30
+
+[[checks]]
+id = "exocrate-tests"
+image = "anneal-tc"
+sandbox = "nested_bwrap"
+runner = "ubuntu-24.04"
+workdir = "exocrate"
+inputs = [
+  { kind = "cargo_workspace", manifest_path = "exocrate/Cargo.toml" },
+]
+command = ["cargo", "test", "--workspace", "--offline"]
+env = { CARGO_HOME = "/cargo-home", CARGO_NET_OFFLINE = "true" }
+caches = ["exocrate-cargo-home"]
+
+[[checks]]
+id = "tools-tests"
+image = "rust-main"
+sandbox = "container"
+runner = "ubuntu-24.04"
+workdir = "tools"
+inputs = [
+  { kind = "cargo_workspace", manifest_path = "tools/Cargo.toml" },
+  { kind = "glob", include = ["ci/check_todo.sh"] },
+]
+command = ["cargo", "test", "--workspace", "--offline"]
+env = { CARGO_HOME = "/cargo-home", CARGO_NET_OFFLINE = "true" }
+caches = ["tools-cargo-home"]

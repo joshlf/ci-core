@@ -1,0 +1,11 @@
+error[E0451]: fields `claim`, `signing_time` and `signer_sha` of struct `VerifiedClaim` are private
+  --> tests/ui/cannot_construct_verified_claim.rs:9:9
+   |
+ 8 |     let _forged = VerifiedClaim {
+   |                   ------------- in this type
+ 9 |         claim,
+   |         ^^^^^ private field
+10 |         signing_time: UnixSecs(1),
+   |         ^^^^^^^^^^^^ private field
+11 |         signer_sha: GitOid::from_hex("0000000000000000000000000000000000000000").unwrap(),
+   |         ^^^^^^^^^^ private field

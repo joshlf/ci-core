@@ -1,0 +1,84 @@
+name: ci-core-review-rerun
+
+on:
+  workflow_call:
+    inputs:
+      config_path:
+        description: Repository-relative path to declarative checks.toml
+        required: false
+        type: string
+        default: ci/checks.toml
+
+permissions: {}
+
+env:
+  CORE_ARCHIVE_RELEASE_URL_X86_64: https://github.com/joshlf/ci-core/releases/download/v0.1.0-alpha.0/ci-core-x86_64-unknown-linux-musl.tar.zst
+  CORE_ARCHIVE_SHA256_X86_64: 0000000000000000000000000000000000000000000000000000000000000000
+  CORE_ARCHIVE_RELEASE_URL_AARCH64: https://github.com/joshlf/ci-core/releases/download/v0.1.0-alpha.0/ci-core-aarch64-unknown-linux-musl.tar.zst
+  CORE_ARCHIVE_SHA256_AARCH64: 0000000000000000000000000000000000000000000000000000000000000000
+  CORE_ARCHIVE_GHCR_REPO: joshlf/ci-core/release-archive
+
+jobs:
+  rerun:
+    name: rerun
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: write # Re-run failed PR workflow after owner approval.
+      contents: read # Bare-fetch live default-branch checks.toml policy.
+      pull-requests: read # Read PR reviews and target PR head SHA.
+    steps:
+      - name: Bootstrap verified ci-core archive
+        id: bootstrap
+        shell: sh
+        run: |
+          set -eu
+          case "$(uname -m)" in
+            x86_64|amd64)
+              URL="$CORE_ARCHIVE_RELEASE_URL_X86_64"
+              SHA="$CORE_ARCHIVE_SHA256_X86_64"
+              ;;
+            aarch64|arm64)
+              URL="$CORE_ARCHIVE_RELEASE_URL_AARCH64"
+              SHA="$CORE_ARCHIVE_SHA256_AARCH64"
+              ;;
+            *)
+              echo "unsupported runner architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          BIN_DIR="$RUNNER_TEMP/ci-core/$SHA"
+          ARCHIVE="$RUNNER_TEMP/ci-core-$SHA.tar.zst"
+          mkdir -p "$BIN_DIR"
+          if ! curl -fsSL --retry 3 -o "$ARCHIVE" "$URL"; then
+            ANON_TOK="$(curl -fsSL "https://ghcr.io/token?service=ghcr.io&scope=repository:${CORE_ARCHIVE_GHCR_REPO}:pull" | jq -r '.token')"
+            REDIRECT_URL="$(curl -fsSI -H "Authorization: Bearer $ANON_TOK" "https://ghcr.io/v2/${CORE_ARCHIVE_GHCR_REPO}/blobs/sha256:${SHA}" | awk 'tolower($1)=="location:" {gsub("\r","",$2); print $2}')"
+            if [ -n "$REDIRECT_URL" ]; then
+              curl -fsSL --retry 3 -o "$ARCHIVE" "$REDIRECT_URL"
+            else
+              curl -fsSL --retry 3 -H "Authorization: Bearer $ANON_TOK" -o "$ARCHIVE" "https://ghcr.io/v2/${CORE_ARCHIVE_GHCR_REPO}/blobs/sha256:${SHA}"
+            fi
+          fi
+          printf '%s  %s\n' "$SHA" "$ARCHIVE" | sha256sum -c -
+          zstd -dc "$ARCHIVE" | tar -xf - -C "$BIN_DIR"
+          rm -f "$ARCHIVE"
+          chmod 0555 "$BIN_DIR/ci-core" "$BIN_DIR/bwrap"
+          printf 'bin_dir=%s\n' "$BIN_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Evaluate fork-safe review rerun policy
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CONFIG_PATH: ${{ inputs.config_path }}
+          SIGNAL_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          BIN_DIR: ${{ steps.bootstrap.outputs.bin_dir }}
+        run: |
+          set -euo pipefail
+          "$BIN_DIR/ci-core" review-rerun \
+            --config "$CONFIG_PATH" \
+            --signal-conclusion "$SIGNAL_CONCLUSION" \
+            --head-sha "$HEAD_SHA" \
+            --bare-git-dir "$RUNNER_TEMP/ci-core-rerun.git"
+          rm -rf "$RUNNER_TEMP/ci-core-rerun.git"

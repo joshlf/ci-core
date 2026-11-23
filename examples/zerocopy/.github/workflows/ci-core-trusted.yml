@@ -1,0 +1,23 @@
+name: ci-core-trusted
+
+on:
+  merge_group: {}
+  push:
+    branches:
+      - main
+
+permissions:
+  actions: read
+  contents: read
+  packages: write
+  id-token: write
+  pull-requests: read
+
+jobs:
+  ci-core:
+    name: ci-core
+    uses: joshlf/ci-core/.github/workflows/ci.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    with:
+      config_path: ci/checks.toml
+      shadow_mode: false
+      force_execute_all: ${{ vars.FORCE_EXECUTE_ALL == 'true' }}

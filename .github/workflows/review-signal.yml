@@ -1,0 +1,23 @@
+name: ci-core-review-signal
+
+on:
+  workflow_call: {}
+
+permissions: {}
+
+jobs:
+  signal:
+    name: signal
+    if: >-
+      github.event.action == 'dismissed' ||
+      github.event.review.state == 'approved' ||
+      github.event.review.state == 'changes_requested' ||
+      (github.event.review.state == 'commented' &&
+        (startsWith(github.event.review.body, '/ci-core approve ') ||
+         startsWith(github.event.review.body, '/ci-core unapprove')))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Emit zero-artifact review signal
+        shell: sh
+        run: "true"
