@@ -207,6 +207,7 @@ jobs:
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TMPDIR: ${{ runner.temp }}
           CONFIG_PATH: ${{ inputs.config_path }}
           RECIPE_DIGEST: ${{ matrix.recipe }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
@@ -362,6 +363,7 @@ jobs:
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TMPDIR: ${{ runner.temp }}
           CI_CORE_BWRAP_BIN: ${{ steps.bootstrap.outputs.bin_dir }}/bwrap
           CONFIG_PATH: ${{ inputs.config_path }}
           PLAN_SHA256: ${{ needs.plan.outputs.plan_sha256 }}
@@ -510,7 +512,6 @@ jobs:
             --shard-meta-root "$RUNNER_TEMP/shard-meta-only"
             --run-id "$RUN_ID"
             --run-attempt "$RUN_ATTEMPT"
-            --cancelled false
             --event "$EVENT_NAME"
             --runtime-ref "$RUNTIME_REF"
             --event-sha "$EVENT_SHA"

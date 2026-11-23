@@ -1297,6 +1297,7 @@ command = ["cargo", "clippy"]
         Some(live_sha),
         false,
         false,
+        false,
         &live_cfg,
         &target_cfg,
         target_sha,
@@ -1333,6 +1334,7 @@ command = ["cargo", "clippy"]
             ev_sha,
             Some(pr_head),
             Some(live_sha),
+            false,
             false,
             false,
             &live_cfg,
@@ -1373,6 +1375,7 @@ command = ["cargo", "clippy"]
             Some(live_sha),
             false,
             false,
+            false,
             &live_cfg,
             &target_cfg,
             target_sha,
@@ -1409,6 +1412,7 @@ command = ["cargo", "clippy"]
             ev_sha,
             Some(pr_head),
             Some(live_sha),
+            false,
             false,
             false,
             &live_cfg,
@@ -1535,6 +1539,7 @@ command = ["cargo", "fmt", "--check"]
             Some(live_sha),
             false,
             false,
+            false,
             &live_cfg,
             &target_cfg,
             target_sha,
@@ -1621,10 +1626,35 @@ command = ["cargo", "fmt", "--check"]
         ReviewRerunDecision::RerunFull
     );
 
-    // 7. Verify `evaluate_pr_tcb` blocks unapproved ExecutableTcb upfront (`TcbPlan::Blocked`),
-    // handles pre-onboarding `base_tree` (`base_cfg_sha256 == sha256(b"")`), and supports stacked
+    // 7. Verify `evaluate_pr_tcb` schedules check execution for unapproved ExecutableTcb PRs
+    // when running under `live_cfg`'s caller/engine (`RequiresOwnerApproval` with
+    // `control_plane_transition: None` so `execute` verifies the PR before `gate` holds for
+    // owner approval, and `rerun-failed-jobs` re-evaluates `gate` alone once approved),
+    // blocks upfront (`TcbPlan::Blocked`) when an unapproved PR modifies caller/engine
+    // pinning (`caller_or_engine_blocked_under_live == true`), handles pre-onboarding
+    // `base_tree` + `ShadowPrPlanOnly` (`live_shadow_pr_authorized`), and supports stacked
     // PRs (`base_ref != default_branch`) in `evaluate_gate`.
     let base_tree = minimal_repo_tree(&live_toml);
+    let unapproved_exec = evaluate_pr_tcb(
+        &RepoRelPath::new("ci/checks.toml").unwrap(),
+        &live_cfg,
+        &live_cfg,
+        &target_cfg,
+        &base_tree,
+        &target_tree,
+        7,
+        pr_head,
+        &[],
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        unapproved_exec,
+        TcbPlan::RequiresOwnerApproval {
+            required_prs: ci_core_model::types::NonEmptyVec::singleton((7, pr_head)),
+            control_plane_transition: None,
+        }
+    );
     let blocked = evaluate_pr_tcb(
         &RepoRelPath::new("ci/checks.toml").unwrap(),
         &live_cfg,
@@ -1635,13 +1665,14 @@ command = ["cargo", "fmt", "--check"]
         7,
         pr_head,
         &[],
+        true,
     )
     .unwrap();
     assert!(matches!(blocked, TcbPlan::Blocked { .. }));
 
     let mut pre_onboard_base = InMemoryTree::new();
     pre_onboard_base.insert_file("src/lib.rs", b"pub fn pre() {}\n".to_vec());
-    let pre_onboard_blocked = evaluate_pr_tcb(
+    let pre_onboard_unapproved = evaluate_pr_tcb(
         &RepoRelPath::new("ci/checks.toml").unwrap(),
         &target_cfg,
         &target_cfg,
@@ -1651,9 +1682,13 @@ command = ["cargo", "fmt", "--check"]
         7,
         pr_head,
         &[],
+        false,
     )
     .unwrap();
-    assert!(matches!(pre_onboard_blocked, TcbPlan::Blocked { .. }));
+    assert!(matches!(
+        pre_onboard_unapproved,
+        TcbPlan::RequiresOwnerApproval { .. }
+    ));
     let pre_onboard_approved = evaluate_pr_tcb(
         &RepoRelPath::new("ci/checks.toml").unwrap(),
         &target_cfg,
@@ -1664,12 +1699,107 @@ command = ["cargo", "fmt", "--check"]
         7,
         pr_head,
         &approvals[&7],
+        false,
     )
     .unwrap();
     assert!(matches!(
         pre_onboard_approved,
         TcbPlan::RequiresOwnerApproval { .. }
     ));
+
+    // Verify `ShadowPrPlanOnly` passes without owner approval when `live_shadow_pr_authorized == true`
+    // (pre-onboarding or `live_tree` already sets `shadow_mode: true`), AND fails closed in Clause 2
+    // when `live_shadow_pr_authorized == false` (blocking unapproved `shadow_mode: false -> true` downgrades!).
+    let mut shadow_plan = plan.clone();
+    shadow_plan.mode = ci_core_model::types::RunMode::ShadowPrPlanOnly;
+    shadow_plan.pending_images.clear();
+    shadow_plan.shards.clear();
+    let shadow_bytes = serde_json::to_vec(&shadow_plan).unwrap();
+    let shadow_sha = Sha256Digest::hash_bytes(&shadow_bytes);
+    let shadow_jobs = ObservedJobResults {
+        plan: UpstreamJobResult::Success,
+        build_images: UpstreamJobResult::Skipped,
+        execute: UpstreamJobResult::Skipped,
+        publish: UpstreamJobResult::Skipped,
+    };
+    let empty_revs: BTreeMap<u64, Vec<ci_core_model::store::PrReview>> =
+        BTreeMap::from([(7, Vec::new())]);
+    assert_eq!(
+        evaluate_gate(
+            EvalStage::FinalGate,
+            false,
+            UnixSecs(10_100),
+            "google/demo",
+            100,
+            TriggerEvent::PullRequest,
+            "refs/pull/7/merge",
+            Some("main"),
+            ev_sha,
+            Some(pr_head),
+            Some(live_sha),
+            true,
+            true,
+            false,
+            &live_cfg,
+            &target_cfg,
+            target_sha,
+            Ok(()),
+            Ok(()),
+            Ok(()),
+            &[],
+            &[],
+            true,
+            &observed_run,
+            shadow_jobs,
+            &shadow_bytes,
+            shadow_sha,
+            &shadow_plan,
+            &empty_revs,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .expect("authorized shadow bring-up PR must pass ShadowPlanVerified"),
+        GatePass::ShadowPlanVerified
+    );
+    assert!(
+        evaluate_gate(
+            EvalStage::FinalGate,
+            false,
+            UnixSecs(10_100),
+            "google/demo",
+            100,
+            TriggerEvent::PullRequest,
+            "refs/pull/7/merge",
+            Some("main"),
+            ev_sha,
+            Some(pr_head),
+            Some(live_sha),
+            true,
+            false,
+            false,
+            &live_cfg,
+            &target_cfg,
+            target_sha,
+            Ok(()),
+            Ok(()),
+            Ok(()),
+            &[],
+            &[],
+            true,
+            &observed_run,
+            shadow_jobs,
+            &shadow_bytes,
+            shadow_sha,
+            &shadow_plan,
+            &empty_revs,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .is_err(),
+        "unapproved shadow_mode downgrade after cutover must fail closed in Clause 2"
+    );
 
     // Stacked PR (`base_ref == Some("stack-base-01")`) passes `evaluate_gate` when bound to `plan.pr_base_ref`,
     // and rejects empty/malformed `base_ref` (`Some("")`, `Some("../evil")`, `None`).
@@ -1699,6 +1829,7 @@ command = ["cargo", "fmt", "--check"]
             ev_sha,
             Some(pr_head),
             Some(Sha256Digest::hash_bytes(&[])),
+            false,
             false,
             false,
             &target_cfg,
@@ -1741,6 +1872,7 @@ command = ["cargo", "fmt", "--check"]
                 ev_sha,
                 Some(pr_head),
                 Some(Sha256Digest::hash_bytes(&[])),
+                false,
                 false,
                 false,
                 &target_cfg,

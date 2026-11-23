@@ -41,8 +41,9 @@ use ci_core_model::store::{BlobDescriptor, GitHubApi, Registry, StoreTier};
 use ci_core_model::tcb::{
     PathTrustClass, TcbPlan, caller_allowed, caller_allowed_effective, classify_under_joined_tcb,
     compute_effective_tcb, diff_trees_paths, evaluate_merge_group_tcb, evaluate_pr_tcb,
-    has_relevant_review_for_stage2, is_owner_approved, resolve_effective_control_plane,
-    validate_codeowners, validate_workflows, verify_engine_workflows, verify_landed_prefix,
+    has_relevant_review_for_stage2, is_owner_approved, live_tree_authorizes_shadow_pr,
+    resolve_effective_control_plane, validate_codeowners, validate_workflows,
+    verify_engine_workflows, verify_landed_prefix,
 };
 use ci_core_model::tree::SourceTree;
 use ci_core_model::types::{
@@ -227,7 +228,7 @@ enum Commands {
         run_id: u64,
         #[arg(long)]
         run_attempt: u32,
-        #[arg(long)]
+        #[arg(long, num_args = 0..=1, default_missing_value = "true", default_value_t = false)]
         cancelled: bool,
         #[arg(long)]
         event: String,
@@ -866,6 +867,15 @@ fn cmd_plan(
             let reviews = api
                 .list_pr_reviews_all(pr_number)
                 .map_err(|e| e.to_string())?;
+            let live_cp = live_cfg.control_plane();
+            let caller_or_engine_blocked_under_live =
+                !caller_allowed(&live_cp.caller, event, &observed_run)
+                    || verify_engine_workflows(
+                        &observed_run.referenced_workflows,
+                        &live_cp.signer,
+                        event,
+                    )
+                    .is_err();
             evaluate_pr_tcb(
                 &config_path,
                 &live_cfg,
@@ -876,6 +886,7 @@ fn cmd_plan(
                 pr_number,
                 pr_head_sha,
                 &reviews,
+                caller_or_engine_blocked_under_live,
             )
             .map_err(|e| e.to_string())?
         }
@@ -1992,6 +2003,8 @@ fn evaluate_gate_or_prepublish_common(
     )
     .map_err(|e| e.to_string())?;
 
+    let live_shadow_pr_authorized =
+        live_tree_authorizes_shadow_pr(&live_tree, &live_cfg, live_onboarded);
     let pass = evaluate_gate(
         stage,
         cancelled,
@@ -2005,6 +2018,7 @@ fn evaluate_gate_or_prepublish_common(
         pr_head_sha,
         pr_base_cfg_sha256,
         shadow_mode,
+        live_shadow_pr_authorized,
         force_execute_all,
         &live_cfg,
         &target_cfg,
@@ -3444,6 +3458,82 @@ fn main() -> ExitCode {
         Err(err) => {
             eprintln!("ci-core error: {err}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod cli_flag_sync_tests {
+    use super::*;
+
+    #[test]
+    fn workflow_cli_invocations_parse_cleanly() {
+        let base_gate = [
+            "ci-core",
+            "gate",
+            "--config",
+            "ci/checks.toml",
+            "--plan-dir",
+            "/tmp/plan-a1",
+            "--expected-plan-sha256",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "--img-meta-root",
+            "/tmp/img-meta",
+            "--shard-meta-root",
+            "/tmp/shard-meta",
+            "--run-id",
+            "1",
+            "--run-attempt",
+            "1",
+            "--event",
+            "pull_request",
+            "--runtime-ref",
+            "refs/pull/1/merge",
+            "--event-sha",
+            "0000000000000000000000000000000000000000",
+            "--job-plan-result",
+            "success",
+            "--job-build-images-result",
+            "skipped",
+            "--job-execute-result",
+            "skipped",
+            "--job-publish-result",
+            "skipped",
+            "--bare-git-dir",
+            "/tmp/bare.git",
+            "--shadow-mode",
+            "--base-ref",
+            "main",
+            "--pr-head-sha",
+            "0000000000000000000000000000000000000000",
+        ];
+        let parsed = Cli::try_parse_from(base_gate).expect("default gate invocation must parse");
+        match parsed.command {
+            Commands::Gate {
+                cancelled,
+                shadow_mode,
+                ..
+            } => {
+                assert!(!cancelled);
+                assert!(shadow_mode);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        // Also accept explicit `--cancelled`, `--cancelled true`, and `--cancelled false`.
+        for extra in [
+            vec!["--cancelled"],
+            vec!["--cancelled", "true"],
+            vec!["--cancelled", "false"],
+        ] {
+            let mut args: Vec<&str> = base_gate.to_vec();
+            args.extend(extra.iter().copied());
+            let p = Cli::try_parse_from(&args).expect("cancelled variants must parse");
+            if let Commands::Gate { cancelled, .. } = p.command {
+                assert_eq!(cancelled, extra != vec!["--cancelled", "false"]);
+            } else {
+                panic!("expected Gate");
+            }
         }
     }
 }

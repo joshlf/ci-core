@@ -1038,6 +1038,7 @@ pub fn evaluate_gate(
     pr_head_sha: Option<GitOid>,
     pr_base_cfg_sha256: Option<Sha256Digest>,
     caller_shadow_mode: bool,
+    live_shadow_pr_authorized: bool,
     caller_force_execute_all: bool,
     live_cfg: &ChecksConfig,
     target_cfg: &ChecksConfig,
@@ -1251,8 +1252,8 @@ pub fn evaluate_gate(
     }
 
     // -----------------------------------------------------------------------
-    // Clause 2: TCB Authorization (Unconditional Across All Modes, Anchored to
-    // Fresh `live_cfg`).
+    // Clause 2: TCB Authorization (Enforced on Enforcing & Trusted Runs;
+    // `ShadowPrPlanOnly` Bring-Up Runs Require Default-Branch Shadow Posture).
     // -----------------------------------------------------------------------
     if runtime_event == TriggerEvent::PullRequest {
         if plan.second_parent.is_none() || plan.second_parent != pr_head_sha {
@@ -1267,9 +1268,34 @@ pub fn evaluate_gate(
             ));
         }
     }
-    if let TcbPlan::RequiresOwnerApproval {
-        ref required_prs, ..
-    } = plan.tcb
+    let is_shadow = plan.mode == RunMode::ShadowPrPlanOnly;
+    if is_shadow
+        && !live_shadow_pr_authorized
+        && matches!(plan.tcb, TcbPlan::RequiresOwnerApproval { .. })
+    {
+        for (pr_num, head_sha) in match &plan.tcb {
+            TcbPlan::RequiresOwnerApproval { required_prs, .. } => required_prs,
+            _ => unreachable!(),
+        } {
+            let reviews = approval_reviews_by_pr.get(pr_num).ok_or_else(|| {
+                GateError::Clause2(format!("missing PR reviews for required PR #{pr_num}"))
+            })?;
+            if !is_owner_approved(
+                reviews,
+                &live_cfg.tcb.owner_user_ids,
+                live_cfg.tcb.allow_owner_self_approval,
+                head_sha,
+            ) {
+                return Err(GateError::Clause2(format!(
+                    "PR #{pr_num} at `{head_sha}` cannot enable shadow_mode without live owner approval"
+                )));
+            }
+        }
+    }
+    if !is_shadow
+        && let TcbPlan::RequiresOwnerApproval {
+            ref required_prs, ..
+        } = plan.tcb
     {
         for (pr_num, head_sha) in required_prs {
             let reviews = approval_reviews_by_pr.get(pr_num).ok_or_else(|| {
@@ -1291,7 +1317,6 @@ pub fn evaluate_gate(
     // -----------------------------------------------------------------------
     // Clause 3: Upstream Job Consistency.
     // -----------------------------------------------------------------------
-    let is_shadow = plan.mode == RunMode::ShadowPrPlanOnly;
     if is_shadow {
         if stage != EvalStage::FinalGate
             || plan.needs_publish

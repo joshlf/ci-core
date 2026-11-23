@@ -2030,8 +2030,78 @@ pub fn diff_trees_paths(
     Ok(changed)
 }
 
+/// Returns `true` iff `ShadowPrPlanOnly` (`shadow_mode: true`) is already the
+/// default-branch `pull_request` posture (`!live_onboarded`, or `live_cfg.tcb.caller`
+/// is `RepoRuleset` and every `pull_request` caller workflow in `live_tree` sets
+/// `with.shadow_mode: true`).
+///
+/// Once `default_branch` cuts over to `shadow_mode: false`, this returns `false`
+/// so an unapproved PR cannot downgrade `shadow_mode: false -> true` to bypass
+/// check execution or owner approval (`Clause 2`).
+pub fn live_tree_authorizes_shadow_pr(
+    live_tree: &dyn SourceTree,
+    live_cfg: &ChecksConfig,
+    live_onboarded: bool,
+) -> bool {
+    if !live_onboarded {
+        return true;
+    }
+    let CallerMode::RepoRuleset {
+        ref caller_workflows,
+        ..
+    } = live_cfg.tcb.caller
+    else {
+        return false;
+    };
+    let mut saw_pr_caller = false;
+    for cw in caller_workflows {
+        let Ok(wf_map) = read_regular_100644_yaml(live_tree, cw) else {
+            return false;
+        };
+        let Ok((trigs, _)) = extract_on_trigger_names(&wf_map, cw.as_str()) else {
+            return false;
+        };
+        if !trigs.contains("pull_request") {
+            continue;
+        }
+        saw_pr_caller = true;
+        let Some(jobs_map) =
+            yaml_map_get(&wf_map, "jobs").and_then(serde_yaml_ng::Value::as_mapping)
+        else {
+            return false;
+        };
+        if jobs_map.len() != 1 {
+            return false;
+        }
+        let Some((_, jval)) = jobs_map.iter().next() else {
+            return false;
+        };
+        let is_shadow = jval
+            .as_mapping()
+            .and_then(|jm| yaml_map_get(jm, "with"))
+            .and_then(serde_yaml_ng::Value::as_mapping)
+            .and_then(|wm| yaml_map_get(wm, "shadow_mode"))
+            .and_then(serde_yaml_ng::Value::as_bool)
+            == Some(true);
+        if !is_shadow {
+            return false;
+        }
+    }
+    saw_pr_caller
+}
+
 /// Evaluates `pull_request` TCB classification under
 /// `⊔_{c ∈ {live_cfg, base_cfg, candidate_cfg}} EffectiveTcb(c, {T_b, T_e})`.
+///
+/// Because `pull_request` runs execute with zero secrets, read-only `GITHUB_TOKEN`
+/// permissions, and `publish_eligible == false` (`0` GHCR or Sigstore writes),
+/// unapproved `ExecutableTcb` changes still validate workflows/`CODEOWNERS` and
+/// run `build-images` + `execute` under `live_cfg`'s control plane (`TcbPlan::RequiresOwnerApproval`
+/// with `control_plane_transition: None` until approved) so authors and reviewers
+/// receive full CI verification before Gate 5 owner approval, falling back to
+/// `TcbPlan::Blocked` only when an unapproved PR on an already-onboarded repo
+/// invokes an engine workflow or caller not authorized by `live_cfg`
+/// (`caller_or_engine_blocked_under_live == true`).
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_pr_tcb(
     config_path: &RepoRelPath,
@@ -2043,6 +2113,7 @@ pub fn evaluate_pr_tcb(
     pr_number: u64,
     pr_head_sha: GitOid,
     reviews: &[PrReview],
+    caller_or_engine_blocked_under_live: bool,
 ) -> Result<TcbPlan, TcbError> {
     let trees: [&dyn SourceTree; 2] = [base_tree, event_tree];
     let maps = [
@@ -2075,7 +2146,7 @@ pub fn evaluate_pr_tcb(
     );
 
     if !exec_changed.is_empty() {
-        if !approved {
+        if !approved && caller_or_engine_blocked_under_live {
             return Ok(TcbPlan::Blocked {
                 paths: NonEmptyVec::new(exec_changed).expect("non-empty"),
             });
@@ -2084,7 +2155,7 @@ pub fn evaluate_pr_tcb(
         validate_codeowners(event_tree, candidate_cfg, config_path)?;
         return Ok(TcbPlan::RequiresOwnerApproval {
             required_prs: NonEmptyVec::singleton((pr_number, pr_head_sha)),
-            control_plane_transition: tr,
+            control_plane_transition: if approved { tr } else { None },
         });
     }
 
