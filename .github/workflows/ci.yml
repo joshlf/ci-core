@@ -481,13 +481,36 @@ jobs:
           chmod 0555 "$BIN_DIR/ci-core" "$BIN_DIR/bwrap"
           printf 'bin_dir=%s\n' "$BIN_DIR" >> "$GITHUB_OUTPUT"
 
-      - name: Download run metadata artifacts
+      # Download the plan by name so it always lands in its own
+      # directory: `actions/download-artifact` extracts a lone
+      # pattern match directly into `path`, which happens when a
+      # run has no image or shard metadata.
+      - name: Download plan metadata artifact
         timeout-minutes: 5
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: '{plan-a${{ needs.plan.outputs.plan_attempt }},img-meta-*,shard-meta-*}'
+          name: plan-a${{ needs.plan.outputs.plan_attempt }}
+          path: ${{ runner.temp }}/meta-in/plan-a${{ needs.plan.outputs.plan_attempt }}
+
+      # Image and shard metadata are read by file name
+      # (`img-meta.json`, `shard-meta.json`) anywhere under their
+      # roots, so a flattened lone match is fine. Separate roots
+      # keep each artifact class from supplying the other's files.
+      - name: Download image metadata artifacts
+        timeout-minutes: 5
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: img-meta-*
           merge-multiple: false
-          path: ${{ runner.temp }}/meta-in
+          path: ${{ runner.temp }}/img-meta-only
+
+      - name: Download shard metadata artifacts
+        timeout-minutes: 5
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: shard-meta-*
+          merge-multiple: false
+          path: ${{ runner.temp }}/shard-meta-only
 
       - name: Pre-verify, push blobs, sign batch Bundle0_3, and commit claims
         timeout-minutes: 30
@@ -512,14 +535,6 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/img-meta-only" "$RUNNER_TEMP/shard-meta-only"
-          shopt -s nullglob
-          for d in "$RUNNER_TEMP/meta-in"/img-meta-*; do
-            mv "$d" "$RUNNER_TEMP/img-meta-only/"
-          done
-          for d in "$RUNNER_TEMP/meta-in"/shard-meta-*; do
-            mv "$d" "$RUNNER_TEMP/shard-meta-only/"
-          done
-          shopt -u nullglob
           ARGS=(
             publish
             --config "$CONFIG_PATH"
@@ -597,13 +612,36 @@ jobs:
           chmod 0555 "$BIN_DIR/ci-core" "$BIN_DIR/bwrap"
           printf 'bin_dir=%s\n' "$BIN_DIR" >> "$GITHUB_OUTPUT"
 
-      - name: Download metadata artifacts
+      # Download the plan by name so it always lands in its own
+      # directory: `actions/download-artifact` extracts a lone
+      # pattern match directly into `path`, which happens when a
+      # run has no image or shard metadata.
+      - name: Download plan metadata artifact
         if: needs.plan.result == 'success'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: '{plan-a${{ needs.plan.outputs.plan_attempt }},img-meta-*,shard-meta-*}'
+          name: plan-a${{ needs.plan.outputs.plan_attempt }}
+          path: ${{ runner.temp }}/meta-in/plan-a${{ needs.plan.outputs.plan_attempt }}
+
+      # Image and shard metadata are read by file name
+      # (`img-meta.json`, `shard-meta.json`) anywhere under their
+      # roots, so a flattened lone match is fine. Separate roots
+      # keep each artifact class from supplying the other's files.
+      - name: Download image metadata artifacts
+        if: needs.plan.result == 'success'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: img-meta-*
           merge-multiple: false
-          path: ${{ runner.temp }}/meta-in
+          path: ${{ runner.temp }}/img-meta-only
+
+      - name: Download shard metadata artifacts
+        if: needs.plan.result == 'success'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: shard-meta-*
+          merge-multiple: false
+          path: ${{ runner.temp }}/shard-meta-only
 
       - name: Evaluate compile-time-offline FinalGate
         shell: bash
@@ -633,14 +671,6 @@ jobs:
             exit 1
           fi
           mkdir -p "$RUNNER_TEMP/img-meta-only" "$RUNNER_TEMP/shard-meta-only"
-          shopt -s nullglob
-          for d in "$RUNNER_TEMP/meta-in"/img-meta-*; do
-            mv "$d" "$RUNNER_TEMP/img-meta-only/"
-          done
-          for d in "$RUNNER_TEMP/meta-in"/shard-meta-*; do
-            mv "$d" "$RUNNER_TEMP/shard-meta-only/"
-          done
-          shopt -u nullglob
           ARGS=(
             gate
             --config "$CONFIG_PATH"
