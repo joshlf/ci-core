@@ -149,6 +149,28 @@ impl HttpGitHubApi {
         Ok(parsed.into())
     }
 
+    /// Reads the merge method of `branch`'s merge queue from its active
+    /// rules (`GET /repos/{owner}/{repo}/rules/branches/{branch}`), which
+    /// only needs repository metadata access.
+    fn merge_queue_method(&self, branch: &str) -> Result<MergeMethod, GhApiError> {
+        let mut url = Some(format!(
+            "{}/repos/{}/rules/branches/{}?per_page=100",
+            self.api_base,
+            self.slug.canonical(),
+            percent_encode_path_segment(branch)
+        ));
+        let mut rules = Vec::new();
+        while let Some(u) = url {
+            let (val, next) = self.get_json_with_next(&u)?;
+            let page = val.as_array().ok_or_else(|| {
+                GhApiError::Request(format!("branch rules for `{branch}` are not a JSON array"))
+            })?;
+            rules.extend(page.iter().cloned());
+            url = next;
+        }
+        merge_method_from_branch_rules(&rules, branch)
+    }
+
     fn get_json_with_next(
         &self,
         url: &str,
@@ -387,7 +409,6 @@ impl GitHubApi for HttpGitHubApi {
             query($owner: String!, $name: String!, $branch: String!, $cursor: String) {
               repository(owner: $owner, name: $name) {
                 mergeQueue(branch: $branch) {
-                  configuration { mergeMethod }
                   entries(first: 100, after: $cursor) {
                     pageInfo { hasNextPage endCursor }
                     nodes {
@@ -401,8 +422,11 @@ impl GitHubApi for HttpGitHubApi {
               }
             }
         "#;
+        // `mergeQueue.configuration` needs repository administration access,
+        // which `GITHUB_TOKEN` never has, so the merge method comes from the
+        // branch's active rules instead.
+        let merge_method = self.merge_queue_method(branch)?;
         let mut cursor: Option<String> = None;
-        let mut merge_method_opt: Option<MergeMethod> = None;
         let mut entries = Vec::new();
 
         loop {
@@ -421,24 +445,6 @@ impl GitHubApi for HttpGitHubApi {
                 .ok_or_else(|| {
                     GhApiError::NotFound(format!("mergeQueue not enabled on branch `{branch}`"))
                 })?;
-
-            if merge_method_opt.is_none() {
-                let mm_str = mq
-                    .pointer("/configuration/mergeMethod")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("MERGE");
-                let mm = match mm_str {
-                    "MERGE" => MergeMethod::Merge,
-                    "SQUASH" => MergeMethod::Squash,
-                    "REBASE" => MergeMethod::Rebase,
-                    other => {
-                        return Err(GhApiError::Request(format!(
-                            "unsupported mergeQueue mergeMethod {other:?}"
-                        )));
-                    }
-                };
-                merge_method_opt = Some(mm);
-            }
 
             if let Some(nodes) = mq
                 .pointer("/entries/nodes")
@@ -505,7 +511,7 @@ impl GitHubApi for HttpGitHubApi {
         }
 
         Ok(MergeQueueSnapshot {
-            merge_method: merge_method_opt.unwrap_or(MergeMethod::Merge),
+            merge_method,
             entries,
         })
     }
@@ -925,5 +931,120 @@ impl GitHubRerunClient {
             AttemptErr::Transient(msg) => GhApiError::Request(msg),
             AttemptErr::Fatal(err) => err,
         })
+    }
+}
+
+/// Percent-encodes every byte of `segment` outside the RFC 3986 unreserved
+/// set, so a branch name is a single URL path segment.
+fn percent_encode_path_segment(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    for b in segment.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Extracts the single merge method that the `merge_queue` rules in
+/// `rules` (a branch's active rules) configure, failing closed when there is
+/// no such rule or the rules disagree.
+fn merge_method_from_branch_rules(
+    rules: &[serde_json::Value],
+    branch: &str,
+) -> Result<MergeMethod, GhApiError> {
+    let mut method: Option<MergeMethod> = None;
+    for rule in rules {
+        if rule.get("type").and_then(serde_json::Value::as_str) != Some("merge_queue") {
+            continue;
+        }
+        let raw = rule
+            .pointer("/parameters/merge_method")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                GhApiError::Request(format!(
+                    "merge_queue rule on `{branch}` lacks parameters.merge_method"
+                ))
+            })?;
+        let m = match raw {
+            "MERGE" => MergeMethod::Merge,
+            "SQUASH" => MergeMethod::Squash,
+            "REBASE" => MergeMethod::Rebase,
+            other => {
+                return Err(GhApiError::Request(format!(
+                    "unsupported mergeQueue mergeMethod {other:?}"
+                )));
+            }
+        };
+        match method {
+            Some(prev) if prev != m => {
+                return Err(GhApiError::Request(format!(
+                    "merge_queue rules on `{branch}` disagree on the merge method"
+                )));
+            }
+            _ => method = Some(m),
+        }
+    }
+    method
+        .ok_or_else(|| GhApiError::NotFound(format!("mergeQueue not enabled on branch `{branch}`")))
+}
+
+#[cfg(test)]
+mod merge_method_tests {
+    use super::*;
+
+    fn mq_rule(method: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "merge_queue",
+            "ruleset_id": 1,
+            "parameters": { "merge_method": method, "max_entries_to_build": 5 },
+        })
+    }
+
+    #[test]
+    fn reads_merge_method_from_branch_rules() {
+        let rules = vec![
+            serde_json::json!({ "type": "required_status_checks", "parameters": {} }),
+            mq_rule("SQUASH"),
+        ];
+        assert_eq!(
+            merge_method_from_branch_rules(&rules, "main").unwrap(),
+            MergeMethod::Squash
+        );
+        assert_eq!(
+            merge_method_from_branch_rules(&[mq_rule("MERGE"), mq_rule("MERGE")], "main").unwrap(),
+            MergeMethod::Merge
+        );
+        assert_eq!(
+            merge_method_from_branch_rules(&[mq_rule("REBASE")], "main").unwrap(),
+            MergeMethod::Rebase
+        );
+    }
+
+    #[test]
+    fn merge_method_fails_closed() {
+        let none = vec![serde_json::json!({ "type": "deletion" })];
+        assert!(matches!(
+            merge_method_from_branch_rules(&none, "main"),
+            Err(GhApiError::NotFound(_))
+        ));
+        assert!(
+            merge_method_from_branch_rules(&[mq_rule("SQUASH"), mq_rule("MERGE")], "main").is_err()
+        );
+        assert!(merge_method_from_branch_rules(&[mq_rule("FAST_FORWARD")], "main").is_err());
+        let missing = vec![serde_json::json!({ "type": "merge_queue", "parameters": {} })];
+        assert!(merge_method_from_branch_rules(&missing, "main").is_err());
+    }
+
+    #[test]
+    fn branch_names_encode_as_one_path_segment() {
+        assert_eq!(percent_encode_path_segment("main"), "main");
+        assert_eq!(
+            percent_encode_path_segment("release/v1.x"),
+            "release%2Fv1.x"
+        );
+        assert_eq!(percent_encode_path_segment("a b?#"), "a%20b%3F%23");
     }
 }
