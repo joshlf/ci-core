@@ -198,6 +198,22 @@ jobs:
           printf 'bin_dir=%s\n' "$BIN_DIR" >> "$GITHUB_OUTPUT"
 
       - name: Download plan metadata
+        id: dl_plan_metadata
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: plan-a${{ needs.plan.outputs.plan_attempt }}
+          path: ${{ runner.temp }}/plan-in
+
+      # Same-run artifact lookups can fail transiently; retry once.
+      - name: Wait before retrying download plan metadata
+        if: steps.dl_plan_metadata.outcome == 'failure'
+        env:
+          DL_PATH: ${{ runner.temp }}/plan-in
+        run: rm -rf -- "$DL_PATH" && sleep 20
+
+      - name: Download plan metadata (retry)
+        if: steps.dl_plan_metadata.outcome == 'failure'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: plan-a${{ needs.plan.outputs.plan_attempt }}
@@ -318,13 +334,46 @@ jobs:
           fi
 
       - name: Download plan metadata
+        id: dl_plan_metadata
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: plan-a${{ needs.plan.outputs.plan_attempt }}
+          path: ${{ runner.temp }}/plan-in
+
+      # Same-run artifact lookups can fail transiently; retry once.
+      - name: Wait before retrying download plan metadata
+        if: steps.dl_plan_metadata.outcome == 'failure'
+        env:
+          DL_PATH: ${{ runner.temp }}/plan-in
+        run: rm -rf -- "$DL_PATH" && sleep 20
+
+      - name: Download plan metadata (retry)
+        if: steps.dl_plan_metadata.outcome == 'failure'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: plan-a${{ needs.plan.outputs.plan_attempt }}
           path: ${{ runner.temp }}/plan-in
 
       - name: Download image metadata records
+        id: dl_image_metadata_records
         if: needs.plan.outputs.has_images == 'true'
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: img-meta-*
+          merge-multiple: false
+          path: ${{ runner.temp }}/img-meta-in
+
+      # Same-run artifact lookups can fail transiently; retry once.
+      - name: Wait before retrying download image metadata records
+        if: steps.dl_image_metadata_records.outcome == 'failure'
+        env:
+          DL_PATH: ${{ runner.temp }}/img-meta-in
+        run: rm -rf -- "$DL_PATH" && sleep 20
+
+      - name: Download image metadata records (retry)
+        if: steps.dl_image_metadata_records.outcome == 'failure'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: img-meta-*
@@ -352,7 +401,23 @@ jobs:
             --github-output "$GITHUB_OUTPUT"
 
       - name: Download winning image OCI layout blob
+        id: dl_winning_image_oci_layout_blob
         if: matrix.image_pending == true
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ steps.resolve_img.outputs.img_blob_artifact }}
+          path: ${{ runner.temp }}/img-blob-in
+
+      # Same-run artifact lookups can fail transiently; retry once.
+      - name: Wait before retrying download winning image OCI layout blob
+        if: steps.dl_winning_image_oci_layout_blob.outcome == 'failure'
+        env:
+          DL_PATH: ${{ runner.temp }}/img-blob-in
+        run: rm -rf -- "$DL_PATH" && sleep 20
+
+      - name: Download winning image OCI layout blob (retry)
+        if: steps.dl_winning_image_oci_layout_blob.outcome == 'failure'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ${{ steps.resolve_img.outputs.img_blob_artifact }}
@@ -465,7 +530,23 @@ jobs:
       # pattern match directly into `path`, which happens when a
       # run has no image or shard metadata.
       - name: Download plan metadata artifact
+        id: dl_plan_metadata_artifact
         if: needs.plan.result == 'success'
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: plan-a${{ needs.plan.outputs.plan_attempt }}
+          path: ${{ runner.temp }}/meta-in/plan-a${{ needs.plan.outputs.plan_attempt }}
+
+      # Same-run artifact lookups can fail transiently; retry once.
+      - name: Wait before retrying download plan metadata artifact
+        if: steps.dl_plan_metadata_artifact.outcome == 'failure'
+        env:
+          DL_PATH: ${{ runner.temp }}/meta-in/plan-a${{ needs.plan.outputs.plan_attempt }}
+        run: rm -rf -- "$DL_PATH" && sleep 20
+
+      - name: Download plan metadata artifact (retry)
+        if: steps.dl_plan_metadata_artifact.outcome == 'failure'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: plan-a${{ needs.plan.outputs.plan_attempt }}
@@ -476,7 +557,24 @@ jobs:
       # roots, so a flattened lone match is fine. Separate roots
       # keep each artifact class from supplying the other's files.
       - name: Download image metadata artifacts
+        id: dl_image_metadata_artifacts
         if: needs.plan.result == 'success'
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: img-meta-*
+          merge-multiple: false
+          path: ${{ runner.temp }}/img-meta-only
+
+      # Same-run artifact lookups can fail transiently; retry once.
+      - name: Wait before retrying download image metadata artifacts
+        if: steps.dl_image_metadata_artifacts.outcome == 'failure'
+        env:
+          DL_PATH: ${{ runner.temp }}/img-meta-only
+        run: rm -rf -- "$DL_PATH" && sleep 20
+
+      - name: Download image metadata artifacts (retry)
+        if: steps.dl_image_metadata_artifacts.outcome == 'failure'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: img-meta-*
@@ -484,7 +582,24 @@ jobs:
           path: ${{ runner.temp }}/img-meta-only
 
       - name: Download shard metadata artifacts
+        id: dl_shard_metadata_artifacts
         if: needs.plan.result == 'success'
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: shard-meta-*
+          merge-multiple: false
+          path: ${{ runner.temp }}/shard-meta-only
+
+      # Same-run artifact lookups can fail transiently; retry once.
+      - name: Wait before retrying download shard metadata artifacts
+        if: steps.dl_shard_metadata_artifacts.outcome == 'failure'
+        env:
+          DL_PATH: ${{ runner.temp }}/shard-meta-only
+        run: rm -rf -- "$DL_PATH" && sleep 20
+
+      - name: Download shard metadata artifacts (retry)
+        if: steps.dl_shard_metadata_artifacts.outcome == 'failure'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: shard-meta-*
