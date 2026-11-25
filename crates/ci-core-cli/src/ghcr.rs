@@ -12,7 +12,7 @@ use std::time::Duration;
 use backon::{BlockingRetryable, ExponentialBuilder};
 use base64::Engine as _;
 use ci_core_model::store::{
-    BlobDescriptor, BlobRef, RawClaimArtifact, Registry, StoreError, StoreTier,
+    BlobDescriptor, BlobRef, BlobUploadStats, RawClaimArtifact, Registry, StoreError, StoreTier,
 };
 use ci_core_model::types::{LookupTag, RepoSlug, Sha256Digest};
 use reqwest::StatusCode;
@@ -847,13 +847,15 @@ impl GhcrRegistry {
         fs::read(tmp.path()).map_err(|e| StoreError::InvalidFormat(e.to_string()))
     }
 
+    /// Uploads a blob unless `HEAD` shows the registry already holds it.
+    /// Returns `true` if bytes were transferred.
     fn ensure_blob_uploaded_source<F>(
         &self,
         tier: StoreTier,
         digest: &Sha256Digest,
         expected_size: u64,
         open_body: F,
-    ) -> Result<(), StoreError>
+    ) -> Result<bool, StoreError>
     where
         F: Fn() -> Result<Body, StoreError>,
     {
@@ -862,7 +864,7 @@ impl GhcrRegistry {
         let head_url = format!("https://{host}/v2/{repo}/blobs/sha256:{}", digest.to_hex());
         let start_url = format!("https://{host}/v2/{repo}/blobs/uploads/");
 
-        (|| -> Result<(), StoreError> {
+        (|| -> Result<bool, StoreError> {
             let head_resp = self
                 .api_client
                 .head(&head_url)
@@ -870,7 +872,7 @@ impl GhcrRegistry {
                 .send()
                 .map_err(|e| StoreError::Transient(e.to_string()))?;
             if head_resp.status().is_success() {
-                return Ok(());
+                return Ok(false);
             }
 
             let post_resp = self
@@ -919,7 +921,7 @@ impl GhcrRegistry {
                     "PUT blob upload failed with HTTP {st}"
                 )));
             }
-            Ok(())
+            Ok(true)
         })
         .retry(oci_retry_policy())
         .when(|e| matches!(e, StoreError::Transient(_)))
@@ -931,7 +933,7 @@ impl GhcrRegistry {
         tier: StoreTier,
         digest: &Sha256Digest,
         bytes: &[u8],
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         let actual = Sha256Digest::hash_bytes(bytes);
         if &actual != digest {
             return Err(StoreError::DigestMismatch(format!(
@@ -1221,21 +1223,28 @@ impl Registry for GhcrRegistry {
         layout_dir: &Path,
         expected_manifest: &Sha256Digest,
         anchor_tag: &LookupTag,
-    ) -> Result<(), StoreError> {
+    ) -> Result<BlobUploadStats, StoreError> {
         let verified = verify_oci_layout(layout_dir, expected_manifest)?;
+        let mut stats = BlobUploadStats::default();
         for (blob_dig, expected_sz) in &verified.content_blobs {
             let blob_path = layout_dir
                 .join("blobs")
                 .join("sha256")
                 .join(blob_dig.to_hex());
-            self.upload_verified_blob(tier, &blob_path, blob_dig, *expected_sz)?;
+            if self.upload_verified_blob(tier, &blob_path, blob_dig, *expected_sz)? {
+                stats.uploaded += 1;
+                stats.uploaded_bytes += *expected_sz;
+            } else {
+                stats.skipped += 1;
+            }
         }
         self.put_manifest_raw(
             tier,
             anchor_tag.as_str(),
             &verified.manifest_media_type,
             &verified.raw_manifest_bytes,
-        )
+        )?;
+        Ok(stats)
     }
 
     fn upload_verified_blob(
@@ -1244,7 +1253,7 @@ impl Registry for GhcrRegistry {
         path: &Path,
         expected_digest: &Sha256Digest,
         expected_size: u64,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         let (actual_digest, actual_size) = hash_local_file(path)?;
         if &actual_digest != expected_digest || actual_size != expected_size {
             return Err(StoreError::DigestMismatch(format!(
@@ -1258,6 +1267,74 @@ impl Registry for GhcrRegistry {
             let f = File::open(path).map_err(|e| StoreError::InvalidFormat(e.to_string()))?;
             Ok(Body::sized(f, expected_size))
         })
+    }
+
+    fn blob_exists(
+        &self,
+        tier: StoreTier,
+        digest: &Sha256Digest,
+        expected_size: u64,
+    ) -> Result<bool, StoreError> {
+        let (host, repo) = self.tier_coords(tier);
+        let url = format!("https://{host}/v2/{repo}/blobs/sha256:{}", digest.to_hex());
+        let tok = self.pull_token(tier)?;
+        (|| -> Result<bool, StoreError> {
+            let mut req = self.api_client.head(&url);
+            if let Some(ref t) = tok {
+                req = req.header("Authorization", format!("Bearer {t}"));
+            }
+            let resp = req
+                .send()
+                .map_err(|e| StoreError::Transient(e.to_string()))?;
+            let st = resp.status();
+            if st.is_server_error() || st == StatusCode::TOO_MANY_REQUESTS {
+                return Err(StoreError::Transient(format!(
+                    "HEAD blob `{digest}` returned HTTP {st}"
+                )));
+            }
+            // Only `2xx` counts, the same test `ensure_blob_uploaded_source`
+            // uses to skip an upload. The digest names the content; the
+            // length check guards against a registry reporting a truncated
+            // object.
+            if !st.is_success() {
+                return Ok(false);
+            }
+            let len = resp
+                .headers()
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+            Ok(len.is_none_or(|l| l == expected_size))
+        })
+        .retry(oci_retry_policy())
+        .when(|e| matches!(e, StoreError::Transient(_)))
+        .call()
+    }
+
+    fn oci_image_anchored(
+        &self,
+        tier: StoreTier,
+        anchor_tag: &LookupTag,
+        expected_manifest: &Sha256Digest,
+    ) -> Result<bool, StoreError> {
+        let Some((raw, _)) = self.get_manifest_raw(tier, anchor_tag.as_str())? else {
+            return Ok(false);
+        };
+        if &Sha256Digest::hash_bytes(&raw) != expected_manifest {
+            return Ok(false);
+        }
+        let Ok(doc) = serde_json::from_slice::<OciImageManifestDoc>(&raw) else {
+            return Ok(false);
+        };
+        for desc in std::iter::once(&doc.config).chain(&doc.layers) {
+            let Ok(dig) = Sha256Digest::from_oci_digest(&desc.digest) else {
+                return Ok(false);
+            };
+            if !self.blob_exists(tier, &dig, desc.size)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn put_claim_artifact(
@@ -1346,6 +1423,7 @@ pub struct InMemoryRegistry {
 struct InMemoryRegistryState {
     blobs: BTreeMap<(StoreTier, Sha256Digest), Vec<u8>>,
     image_layouts: BTreeMap<(StoreTier, Sha256Digest), PathBuf>,
+    anchors: BTreeMap<(StoreTier, LookupTag), Sha256Digest>,
     claims: BTreeMap<(StoreTier, LookupTag), RawClaimArtifact>,
     committed_tags_order: Vec<(StoreTier, LookupTag)>,
     bundle_upload_count: BTreeMap<(StoreTier, Sha256Digest), usize>,
@@ -1382,6 +1460,25 @@ impl InMemoryRegistry {
             .get(&(tier, *bundle_digest))
             .copied()
             .unwrap_or(0)
+    }
+
+    /// Deletes a stored blob, simulating a registry that lost content an
+    /// existing manifest still references.
+    pub fn remove_blob(&self, tier: StoreTier, digest: &Sha256Digest) {
+        self.state
+            .lock()
+            .expect("mutex")
+            .blobs
+            .remove(&(tier, *digest));
+    }
+
+    /// Returns whether a claim manifest is committed at `tag`.
+    pub fn has_claim(&self, tier: StoreTier, tag: &LookupTag) -> bool {
+        self.state
+            .lock()
+            .expect("mutex")
+            .claims
+            .contains_key(&(tier, tag.clone()))
     }
 
     fn is_read_denied(&self, tier: StoreTier) -> bool {
@@ -1491,7 +1588,7 @@ impl Registry for InMemoryRegistry {
         layout_dir: &Path,
         expected_manifest: &Sha256Digest,
         anchor_tag: &LookupTag,
-    ) -> Result<(), StoreError> {
+    ) -> Result<BlobUploadStats, StoreError> {
         let verified = verify_oci_layout(layout_dir, expected_manifest)?;
         let snapshot = layout_dir.parent().unwrap_or(layout_dir).join(format!(
             ".inmem-oci-{}",
@@ -1501,11 +1598,29 @@ impl Registry for InMemoryRegistry {
             fs::remove_dir_all(&snapshot).map_err(|e| StoreError::InvalidFormat(e.to_string()))?;
         }
         copy_dir_recursive_strict(layout_dir, &snapshot)?;
+        let mut stats = BlobUploadStats::default();
+        let mut content = Vec::with_capacity(verified.content_blobs.len());
+        for (dig, sz) in &verified.content_blobs {
+            let path = layout_dir.join("blobs").join("sha256").join(dig.to_hex());
+            let bytes = fs::read(path).map_err(|e| StoreError::InvalidFormat(e.to_string()))?;
+            content.push((*dig, *sz, bytes));
+        }
         let mut st = self.state.lock().expect("mutex");
+        for (dig, sz, bytes) in content {
+            if let std::collections::btree_map::Entry::Vacant(slot) = st.blobs.entry((tier, dig)) {
+                slot.insert(bytes);
+                stats.uploaded += 1;
+                stats.uploaded_bytes += sz;
+            } else {
+                stats.skipped += 1;
+            }
+        }
         st.image_layouts
             .insert((tier, *expected_manifest), snapshot);
+        st.anchors
+            .insert((tier, anchor_tag.clone()), *expected_manifest);
         st.committed_tags_order.push((tier, anchor_tag.clone()));
-        Ok(())
+        Ok(stats)
     }
 
     fn upload_verified_blob(
@@ -1514,7 +1629,7 @@ impl Registry for InMemoryRegistry {
         path: &Path,
         expected_digest: &Sha256Digest,
         expected_size: u64,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         let (actual_digest, actual_size) = hash_local_file(path)?;
         if &actual_digest != expected_digest || actual_size != expected_size {
             return Err(StoreError::DigestMismatch(format!(
@@ -1522,12 +1637,61 @@ impl Registry for InMemoryRegistry {
             )));
         }
         let bytes = fs::read(path).map_err(|e| StoreError::InvalidFormat(e.to_string()))?;
-        self.state
+        let prev = self
+            .state
             .lock()
             .expect("mutex")
             .blobs
             .insert((tier, *expected_digest), bytes);
-        Ok(())
+        Ok(prev.is_none())
+    }
+
+    fn blob_exists(
+        &self,
+        tier: StoreTier,
+        digest: &Sha256Digest,
+        expected_size: u64,
+    ) -> Result<bool, StoreError> {
+        if self.is_read_denied(tier) {
+            return Ok(false);
+        }
+        Ok(self
+            .state
+            .lock()
+            .expect("mutex")
+            .blobs
+            .get(&(tier, *digest))
+            .is_some_and(|b| b.len() as u64 == expected_size))
+    }
+
+    fn oci_image_anchored(
+        &self,
+        tier: StoreTier,
+        anchor_tag: &LookupTag,
+        expected_manifest: &Sha256Digest,
+    ) -> Result<bool, StoreError> {
+        if self.is_read_denied(tier) {
+            return Ok(false);
+        }
+        let layout = {
+            let st = self.state.lock().expect("mutex");
+            if st.anchors.get(&(tier, anchor_tag.clone())) != Some(expected_manifest) {
+                return Ok(false);
+            }
+            let Some(p) = st.image_layouts.get(&(tier, *expected_manifest)) else {
+                return Ok(false);
+            };
+            p.clone()
+        };
+        let Ok(verified) = verify_oci_layout(&layout, expected_manifest) else {
+            return Ok(false);
+        };
+        for (dig, sz) in &verified.content_blobs {
+            if !self.blob_exists(tier, dig, *sz)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn put_claim_artifact(

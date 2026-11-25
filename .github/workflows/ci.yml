@@ -508,7 +508,7 @@ jobs:
       needs.plan.result == 'success'
     runs-on: ubuntu-24.04
     continue-on-error: true
-    timeout-minutes: 60
+    timeout-minutes: 75
     permissions:
       actions: read # Re-verify workflow-run and job attempt metadata.
       contents: read # Re-fetch live default-branch policy and candidate tree.
@@ -638,8 +638,8 @@ jobs:
           merge-multiple: false
           path: ${{ runner.temp }}/shard-meta-only
 
-      - name: Pre-verify, push blobs, sign batch Bundle0_3, and commit claims
-        timeout-minutes: 30
+      - name: Pre-verify, push blobs, sign Bundle0_3 batches, and commit claims
+        timeout-minutes: 50
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

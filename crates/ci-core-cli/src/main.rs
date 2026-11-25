@@ -22,9 +22,7 @@ use ci_core_cli::sandbox::{
     run_cargo_locked_fetch_container, run_cargo_locked_fetch_native, run_container_sandbox,
     run_native_unsandboxed, run_nested_bwrap_sandbox, verify_host_platform,
 };
-use ci_core_cli::signer::{
-    StagedClaim, commit_claims_bottom_up, request_actions_oidc_jwt, sign_batch_claims_online,
-};
+use ci_core_cli::signer::{StagedClaim, request_actions_oidc_jwt, sign_batch_claims_online};
 use ci_core_model::attest::verify_offline;
 use ci_core_model::cargo_static::audit_cargo_locked;
 use ci_core_model::config::{
@@ -37,7 +35,7 @@ use ci_core_model::engine::{
     UpstreamJobResult, build_plan, classify_inflight_run_poll, compute_gc_keep_tags,
     decide_review_rerun, evaluate_gate, resolve_attempt_records, should_attempt_cache_pack,
 };
-use ci_core_model::store::{BlobDescriptor, GitHubApi, Registry, StoreTier};
+use ci_core_model::store::{BlobRef, GitHubApi, Registry, StoreTier};
 use ci_core_model::tcb::{
     PathTrustClass, TcbPlan, caller_allowed, caller_allowed_effective, classify_under_joined_tcb,
     compute_effective_tcb, diff_trees_paths, evaluate_merge_group_tcb, evaluate_pr_tcb,
@@ -50,6 +48,8 @@ use ci_core_model::types::{
     CacheSlotId, CheckId, Claim, GitOid, LocalRunMode, LookupTag, OutputName, RepoRelPath,
     SandboxMode, Sha256Digest, TriggerEvent, UnixSecs, is_valid_git_branch_name,
 };
+
+mod publish;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -2176,23 +2176,6 @@ fn cmd_publish(
         return Err("unexpected GatePass variant for PrePublish".to_owned());
     };
 
-    // `publish` also runs when `execute` failed, so the gate can report the
-    // failed checks. `evaluate_gate` already rejects that case (Clause 3
-    // requires `execute == Success`, Clause 6 requires every outcome to be
-    // `Passed`), but the loops below stage a `Claim::Check` for every outcome
-    // without looking at its status. Check again here so a failed check can
-    // never be signed as a reusable receipt, even if the gate changes.
-    if let Some(out) = shard_outcomes
-        .values()
-        .flat_map(|smeta| &smeta.outcomes)
-        .find(|out| out.status != CheckExecStatus::Passed)
-    {
-        return Err(format!(
-            "refusing to publish: check `{}` did not pass",
-            out.check_id
-        ));
-    }
-
     let eff_cp =
         resolve_effective_control_plane(&live_cfg, &plan.tcb).map_err(|e| e.to_string())?;
     let api = HttpGitHubApi::new(live_cfg.repo.slug.clone(), gh_token_from_env(), None)
@@ -2209,195 +2192,40 @@ fn cmd_publish(
     )
     .map_err(|e| e.to_string())?;
 
+    let cache_tiers: BTreeMap<CacheSlotId, StoreTier> = target_cfg
+        .caches
+        .iter()
+        .map(|(slot, spec)| (slot.clone(), spec.tier))
+        .collect();
+    let inputs = publish::PublishInputs {
+        built_images: &built_images,
+        shard_outcomes: &shard_outcomes,
+        check_provenance: &check_provenance,
+        cache_tiers: &cache_tiers,
+        artifacts: &all_artifacts,
+    };
+    // Mint a fresh OIDC token per batch: the image phase can outlast a
+    // token requested when the step started.
+    let mut sign_batch = |claims: &[StagedClaim]| -> Result<BlobRef, String> {
+        let raw_jwt = request_actions_oidc_jwt().map_err(|e| e.to_string())?;
+        sign_batch_claims_online(&raw_jwt, &eff_cp.signer, claims).map_err(|e| e.to_string())
+    };
     let tmp_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
-    let mut staged_image_claims = Vec::new();
-    let mut staged_cache_claims = Vec::new();
-    let mut staged_check_claims = Vec::new();
-
-    // 1. One `img-blob` at a time (`O(1 blob)` `$RUNNER_TEMP` disk): verify &
-    // push `msha256-<M>` BEFORE minting any signature!
-    for (recipe, bmeta) in &built_images {
-        let art_name = format!("img-blob-a{}-{}", bmeta.attempt, recipe.prefix16());
-        let art = all_artifacts
-            .iter()
-            .find(|a| a.name == art_name)
-            .ok_or_else(|| format!("missing artifact `{art_name}`"))?;
-        let zip_path = tmp_dir.path().join("cur-img.zip");
-        let unzip_dir = tmp_dir.path().join("cur-img-unzip");
-        let layout_dir = tmp_dir.path().join("cur-img-layout");
-        api.download_artifact_zip(art.id, &zip_path)
-            .map_err(|e| e.to_string())?;
-        extract_zip_archive(&zip_path, &unzip_dir)?;
-        let _ = fs::remove_file(&zip_path);
-        unpack_tar_zst_dir(&unzip_dir.join("oci-image.tar.zst"), &layout_dir)?;
-        let _ = fs::remove_dir_all(&unzip_dir);
-
-        let anchor = LookupTag::image_manifest(&bmeta.manifest);
-        let push_res = reg.push_untouched_oci_layout(
-            StoreTier::PublicCas,
-            &layout_dir,
-            &bmeta.manifest,
-            &anchor,
-        );
-        let _ = fs::remove_dir_all(&layout_dir);
-        push_res.map_err(|e| format!("push_untouched_oci_layout `{anchor}`: {e}"))?;
-
-        let iclaim = Claim::Image {
-            recipe: *recipe,
-            manifest: bmeta.manifest,
-        };
-        staged_image_claims.push(
-            StagedClaim::new(StoreTier::PublicCas, &iclaim, Vec::new())
-                .map_err(|e| e.to_string())?,
-        );
-    }
-
-    // Determine lexicographically first `c_updater ∈ R_exec` per
-    // `(StoreTier, CacheKeyDigest)` so each updated cache key is published once.
-    let mut winning_cache_updaters: BTreeMap<
-        (StoreTier, Sha256Digest),
-        (CheckId, CacheSlotId, Sha256Digest, u64),
-    > = BTreeMap::new();
-    for smeta in shard_outcomes.values() {
-        for out in &smeta.outcomes {
-            for sc in &out.staged_caches {
-                let tier = target_cfg.caches[&sc.slot].tier;
-                let key = (tier, sc.cache_key);
-                let replace = match winning_cache_updaters.get(&key) {
-                    None => true,
-                    Some((prev_cid, _, _, _)) => &out.check_id < prev_cid,
-                };
-                if replace {
-                    winning_cache_updaters.insert(
-                        key,
-                        (
-                            out.check_id.clone(),
-                            sc.slot.clone(),
-                            sc.archive_sha256,
-                            sc.size_bytes,
-                        ),
-                    );
-                }
-            }
-        }
-    }
-
-    // 2. One `shard-blob` at a time: verify & upload output/cache blobs BEFORE
-    // signing!
-    for (shard_idx, smeta) in &shard_outcomes {
-        let mut needed_blobs: Vec<(StoreTier, Sha256Digest, u64)> = Vec::new();
-        for out in &smeta.outcomes {
-            for odig in out.outputs.values() {
-                needed_blobs.push((StoreTier::PublicCas, odig.sha256, odig.size_bytes));
-            }
-            for sc in &out.staged_caches {
-                let tier = target_cfg.caches[&sc.slot].tier;
-                if let Some((win_cid, _, _, _)) = winning_cache_updaters.get(&(tier, sc.cache_key))
-                    && win_cid == &out.check_id
-                {
-                    needed_blobs.push((tier, sc.archive_sha256, sc.size_bytes));
-                }
-            }
-        }
-
-        if !needed_blobs.is_empty() {
-            let art_name = format!("shard-blob-a{}-{shard_idx}", smeta.attempt);
-            let art = all_artifacts
-                .iter()
-                .find(|a| a.name == art_name)
-                .ok_or_else(|| format!("missing artifact `{art_name}`"))?;
-            let zip_path = tmp_dir.path().join("cur-shard.zip");
-            let unzip_dir = tmp_dir.path().join("cur-shard-unzip");
-            api.download_artifact_zip(art.id, &zip_path)
-                .map_err(|e| e.to_string())?;
-            extract_zip_archive(&zip_path, &unzip_dir)?;
-            let _ = fs::remove_file(&zip_path);
-
-            for (tier, bdig, bsz) in needed_blobs {
-                let blob_file = unzip_dir.join(bdig.to_hex());
-                if let Err(e) = reg.upload_verified_blob(tier, &blob_file, &bdig, bsz) {
-                    let _ = fs::remove_dir_all(&unzip_dir);
-                    return Err(format!("upload_verified_blob `{bdig}`: {e}"));
-                }
-            }
-            let _ = fs::remove_dir_all(&unzip_dir);
-        }
-
-        for out in &smeta.outcomes {
-            let prov = check_provenance
-                .get(&out.check_id)
-                .cloned()
-                .unwrap_or_default();
-            let mut payload_layers = Vec::with_capacity(out.outputs.len());
-            for (oname, odig) in &out.outputs {
-                payload_layers.push(BlobDescriptor {
-                    digest: odig.sha256,
-                    size_bytes: odig.size_bytes,
-                    media_type: "application/octet-stream".to_owned(),
-                    title: Some(oname.as_str().to_owned()),
-                });
-            }
-            let cclaim = Claim::Check {
-                action: out.action,
-                outputs: out.outputs.clone(),
-                provenance_signers: prov,
-            };
-            staged_check_claims.push(
-                StagedClaim::new(StoreTier::PublicCas, &cclaim, payload_layers)
-                    .map_err(|e| e.to_string())?,
-            );
-        }
-    }
-
-    for ((tier, ckey), (win_cid, slot_id, arch_sha, arch_sz)) in &winning_cache_updaters {
-        let prov = check_provenance.get(win_cid).cloned().unwrap_or_default();
-        let kclaim = Claim::Cache {
-            key: *ckey,
-            slot: slot_id.clone(),
-            archive: *arch_sha,
-            size_bytes: *arch_sz,
-            provenance_signers: prov,
-        };
-        let payload = vec![BlobDescriptor {
-            digest: *arch_sha,
-            size_bytes: *arch_sz,
-            media_type: "application/vnd.ci-core.cache.v1.tar+zstd".to_owned(),
-            title: None,
-        }];
-        staged_cache_claims
-            .push(StagedClaim::new(*tier, &kclaim, payload).map_err(|e| e.to_string())?);
-    }
-
-    let mut all_staged = Vec::new();
-    all_staged.extend(staged_image_claims.iter().cloned());
-    all_staged.extend(staged_cache_claims.iter().cloned());
-    all_staged.extend(staged_check_claims.iter().cloned());
-
-    if all_staged.is_empty() {
-        return Ok(());
-    }
-
-    // 3. Mint ONE batch `Bundle0_3` (`0` GitHub Attestations API calls) and
-    // commit Claim manifests bottom-up: `isha256` -> `ksha256` -> `asha256`.
-    let raw_jwt = request_actions_oidc_jwt().map_err(|e| e.to_string())?;
-    let bundle_blob = sign_batch_claims_online(&raw_jwt, &eff_cp.signer, &all_staged)
-        .map_err(|e| e.to_string())?;
-
-    commit_claims_bottom_up(
+    let summary = publish::publish_verified_outcomes(
+        &inputs,
+        &api,
         &reg,
-        &bundle_blob,
-        &staged_image_claims,
-        &staged_cache_claims,
-        &staged_check_claims,
-    )
-    .map_err(|e| e.to_string())?;
+        &mut sign_batch,
+        tmp_dir.path(),
+        publish::SHARD_PARALLELISM,
+    )?;
 
-    println!(
-        "publish committed {} image(s), {} cache(s), and {} check receipt(s)",
-        staged_image_claims.len(),
-        staged_cache_claims.len(),
-        staged_check_claims.len()
-    );
+    if summary != publish::PublishSummary::default() {
+        println!(
+            "publish committed {} image(s), {} cache(s), and {} check receipt(s)",
+            summary.images, summary.caches, summary.checks
+        );
+    }
     Ok(())
 }
 

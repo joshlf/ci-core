@@ -91,7 +91,18 @@ pub enum StoreError {
     InvalidFormat(String),
 }
 
-/// Narrow 7-method content-addressed and claim-artifact storage interface.
+/// Blob transfer counts reported by `Registry::push_untouched_oci_layout`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BlobUploadStats {
+    /// Blobs whose bytes were transferred to the registry.
+    pub uploaded: u32,
+    /// Total size of the transferred blobs.
+    pub uploaded_bytes: u64,
+    /// Blobs the registry already held, so nothing was transferred.
+    pub skipped: u32,
+}
+
+/// Narrow 9-method content-addressed and claim-artifact storage interface.
 pub trait Registry: Send + Sync {
     /// Fetches a Claim OCI Artifact (`Config` + `Layer 0` bundle + layer
     /// descriptors) by 72-char `LookupTag`.
@@ -140,17 +151,49 @@ pub trait Registry: Send + Sync {
         layout_dir: &Path,
         expected_manifest: &Sha256Digest,
         anchor_tag: &LookupTag,
-    ) -> Result<(), StoreError>;
+    ) -> Result<BlobUploadStats, StoreError>;
 
     /// Verifies `sha256(path) == expected_digest && len(path) == expected_size`
     /// locally first, then uploads the content-addressed blob if absent.
+    ///
+    /// Returns `true` if bytes were transferred and `false` if the registry
+    /// already held the blob.
     fn upload_verified_blob(
         &self,
         tier: StoreTier,
         path: &Path,
         expected_digest: &Sha256Digest,
         expected_size: u64,
-    ) -> Result<(), StoreError>;
+    ) -> Result<bool, StoreError>;
+
+    /// Reports whether the registry holds blob `digest` with length
+    /// `expected_size`.
+    ///
+    /// This answers the same question that `upload_verified_blob` asks before
+    /// transferring bytes, so a caller may skip producing a local copy of a
+    /// blob for which this returns `true`. `404`/`401`/`403` degrade to
+    /// `Ok(false)`, which only costs the caller a redundant upload.
+    fn blob_exists(
+        &self,
+        tier: StoreTier,
+        digest: &Sha256Digest,
+        expected_size: u64,
+    ) -> Result<bool, StoreError>;
+
+    /// Reports whether `anchor_tag` resolves to manifest bytes hashing to
+    /// `expected_manifest` and the registry holds that manifest's config and
+    /// every layer blob at their declared sizes.
+    ///
+    /// When this returns `true`, `push_untouched_oci_layout` with the same
+    /// arguments would upload nothing and rewrite the tag with identical
+    /// bytes. Any doubt (`404`/`401`/`403`, a tag pointing at other bytes,
+    /// an unparsable manifest, or a missing blob) degrades to `Ok(false)`.
+    fn oci_image_anchored(
+        &self,
+        tier: StoreTier,
+        anchor_tag: &LookupTag,
+        expected_manifest: &Sha256Digest,
+    ) -> Result<bool, StoreError>;
 
     /// Uploads `claim_bytes` (`Config`) and `bundle_blob` (`Layer 0`,
     /// deduplicated per `(tier, bundle_blob.digest)`), then commits the Claim
