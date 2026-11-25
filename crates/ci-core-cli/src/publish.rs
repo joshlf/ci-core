@@ -281,23 +281,34 @@ fn publish_image(
     api.download_artifact_zip(art.id, &zip_path)
         .map_err(|e| e.to_string())?;
     let downloaded = fs::metadata(&zip_path).map_or(0, |m| m.len());
+    let t_download = t0.elapsed();
     extract_zip_archive(&zip_path, &unzip_dir)?;
     let _ = fs::remove_file(&zip_path);
+    let t_unzip = t0.elapsed();
     unpack_tar_zst_dir(&unzip_dir.join("oci-image.tar.zst"), &layout_dir)?;
     let _ = fs::remove_dir_all(&unzip_dir);
+    let t_unpack = t0.elapsed();
 
+    // `push_untouched_oci_layout` hashes every blob (`verify_oci_layout`,
+    // then `upload_verified_blob`) before uploading; `ghcr:` lines break
+    // down blobs over 256 MiB.
     let push_res =
         reg.push_untouched_oci_layout(StoreTier::PublicCas, &layout_dir, &bmeta.manifest, &anchor);
     let _ = fs::remove_dir_all(&layout_dir);
     let stats = push_res.map_err(|e| format!("push_untouched_oci_layout `{anchor}`: {e}"))?;
+    let t_push = t0.elapsed();
     eprintln!(
-        "publish: image {}: downloaded {}, uploaded {} blob(s) ({}), {} already present ({}, total {})",
+        "publish: image {}: downloaded {}, uploaded {} blob(s) ({}), {} already present \
+         (download {:.1}s, unzip {:.1}s, unpack {:.1}s, verify+push {:.1}s; total {})",
         recipe.prefix16(),
         human_bytes(downloaded),
         stats.uploaded,
         human_bytes(stats.uploaded_bytes),
         stats.skipped,
-        secs_since(t0),
+        t_download.as_secs_f64(),
+        (t_unzip - t_download).as_secs_f64(),
+        (t_unpack - t_unzip).as_secs_f64(),
+        (t_push - t_unpack).as_secs_f64(),
         secs_since(start),
     );
     Ok(())

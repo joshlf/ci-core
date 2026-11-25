@@ -2,12 +2,13 @@
 //! pure-OCI layout verifier (`verify_oci_layout`, Obligation `O6`), and
 //! deterministic `InMemoryRegistry` fake for integration testing.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use backon::{BlockingRetryable, ExponentialBuilder};
 use base64::Engine as _;
@@ -504,6 +505,27 @@ struct GhcrTokenResponse {
     access_token: Option<String>,
 }
 
+/// Blobs at least this large get a stderr line per transfer attempt, so a
+/// slow run shows where its time goes.
+pub const LARGE_BLOB_LOG_BYTES: u64 = 256 << 20;
+
+/// Total deadline for a monolithic blob `PUT` of `size` bytes: the time to
+/// send it at 8 MiB/s, but at least 5 minutes and at most 45.
+///
+/// The floor leaves slack for small blobs on a slow connection; the cap
+/// bounds how long a stalled upload holds the `publish` step, whose own
+/// timeout is 50 minutes.
+pub fn blob_put_timeout(size: u64) -> Duration {
+    const MIN_RATE_BYTES_PER_SEC: u64 = 8 << 20;
+    const FLOOR: Duration = Duration::from_secs(5 * 60);
+    const CAP: Duration = Duration::from_secs(45 * 60);
+    Duration::from_secs(size / MIN_RATE_BYTES_PER_SEC).clamp(FLOOR, CAP)
+}
+
+fn mib(bytes: u64) -> String {
+    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+}
+
 fn oci_retry_policy() -> ExponentialBuilder {
     ExponentialBuilder::default()
         .with_min_delay(Duration::from_millis(250))
@@ -863,6 +885,7 @@ impl GhcrRegistry {
         let tok = self.push_token(tier)?;
         let head_url = format!("https://{host}/v2/{repo}/blobs/sha256:{}", digest.to_hex());
         let start_url = format!("https://{host}/v2/{repo}/blobs/uploads/");
+        let attempt = Cell::new(0u32);
 
         (|| -> Result<bool, StoreError> {
             let head_resp = self
@@ -901,15 +924,34 @@ impl GhcrRegistry {
                 .append_pair("digest", &digest.to_oci_digest());
 
             let body = open_body()?;
-            let put_resp = self
+            attempt.set(attempt.get() + 1);
+            let t0 = Instant::now();
+            // `api_client`'s 120 s timeout covers sending the whole request
+            // body, which a multi-GiB layer cannot do in time. Give the
+            // `PUT` a deadline scaled to its size instead.
+            let put_res = self
                 .api_client
                 .put(put_url)
+                .timeout(blob_put_timeout(expected_size))
                 .header("Authorization", format!("Bearer {tok}"))
                 .header("Content-Type", "application/octet-stream")
                 .header("Content-Length", expected_size.to_string())
                 .body(body)
-                .send()
-                .map_err(|e| StoreError::Transient(e.to_string()))?;
+                .send();
+            if expected_size >= LARGE_BLOB_LOG_BYTES {
+                let outcome = match &put_res {
+                    Ok(r) => format!("HTTP {}", r.status()),
+                    Err(e) => e.to_string(),
+                };
+                eprintln!(
+                    "ghcr: blob {} ({}): upload attempt {} took {:.1}s: {outcome}",
+                    digest.prefix16(),
+                    mib(expected_size),
+                    attempt.get(),
+                    t0.elapsed().as_secs_f64(),
+                );
+            }
+            let put_resp = put_res.map_err(|e| StoreError::Transient(e.to_string()))?;
             let st = put_resp.status();
             if st.is_server_error() || st == StatusCode::TOO_MANY_REQUESTS {
                 return Err(StoreError::Transient(format!(
@@ -1119,8 +1161,8 @@ impl Registry for GhcrRegistry {
         let (host, repo) = self.tier_coords(tier);
         let url = format!("https://{host}/v2/{repo}/blobs/sha256:{}", digest.to_hex());
         let tok = self.pull_token(tier)?;
-
-        (|| -> Result<u64, StoreError> {
+        // One `GET` attempt; the retry loop below wraps it with logging.
+        let attempt_once = || -> Result<u64, StoreError> {
             let mut req = self.api_client.get(&url);
             if let Some(ref t) = tok {
                 req = req.header("Authorization", format!("Bearer {t}"));
@@ -1211,6 +1253,32 @@ impl Registry for GhcrRegistry {
             }
             fs::rename(&tmp_dest, dest).map_err(|e| StoreError::InvalidFormat(e.to_string()))?;
             Ok(total)
+        };
+
+        // The client timeout bounds each read of the body, not the whole
+        // download, so multi-GiB layers need no per-request deadline here.
+        let attempt = Cell::new(0u32);
+        (|| -> Result<u64, StoreError> {
+            attempt.set(attempt.get() + 1);
+            let t0 = Instant::now();
+            let res = attempt_once();
+            match &res {
+                Ok(total) if *total >= LARGE_BLOB_LOG_BYTES => eprintln!(
+                    "ghcr: blob {} ({}): download attempt {} took {:.1}s",
+                    digest.prefix16(),
+                    mib(*total),
+                    attempt.get(),
+                    t0.elapsed().as_secs_f64(),
+                ),
+                Err(e) if max_bytes >= LARGE_BLOB_LOG_BYTES => eprintln!(
+                    "ghcr: blob {}: download attempt {} failed after {:.1}s: {e}",
+                    digest.prefix16(),
+                    attempt.get(),
+                    t0.elapsed().as_secs_f64(),
+                ),
+                _ => {}
+            }
+            res
         })
         .retry(oci_retry_policy())
         .when(|e| matches!(e, StoreError::Transient(_)))
@@ -1254,7 +1322,16 @@ impl Registry for GhcrRegistry {
         expected_digest: &Sha256Digest,
         expected_size: u64,
     ) -> Result<bool, StoreError> {
+        let t0 = Instant::now();
         let (actual_digest, actual_size) = hash_local_file(path)?;
+        if expected_size >= LARGE_BLOB_LOG_BYTES {
+            eprintln!(
+                "ghcr: blob {} ({}): hashed local copy in {:.1}s",
+                expected_digest.prefix16(),
+                mib(expected_size),
+                t0.elapsed().as_secs_f64(),
+            );
+        }
         if &actual_digest != expected_digest || actual_size != expected_size {
             return Err(StoreError::DigestMismatch(format!(
                 "local blob `{}` ({actual_digest}, {actual_size}B) != expected ({expected_digest}, {expected_size}B)",
@@ -1754,4 +1831,27 @@ fn copy_dir_recursive_strict(src: &Path, dst: &Path) -> Result<(), StoreError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blob_put_timeout_scales_with_size_between_floor_and_cap() {
+        const MIB: u64 = 1 << 20;
+        let secs = |size| blob_put_timeout(size).as_secs();
+        // Floor: anything that sends in under 5 minutes at 8 MiB/s.
+        assert_eq!(secs(0), 300);
+        assert_eq!(secs(2400 * MIB - 1), 300);
+        // Linear in between: size / 8 MiB/s.
+        assert_eq!(secs(2400 * MIB), 300);
+        assert_eq!(secs(4 << 30), 512);
+        assert_eq!(secs(16 << 30), 2048);
+        // Cap: 45 minutes, reached at 21,600 MiB.
+        assert_eq!(secs(21_600 * MIB), 2700);
+        assert_eq!(secs(u64::MAX), 2700);
+        // Every blob gets at least the old 120 s client timeout.
+        assert!(blob_put_timeout(0) > Duration::from_secs(120));
+    }
 }

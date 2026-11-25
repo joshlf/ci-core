@@ -2,10 +2,11 @@
 //! `GitHubRerunClient` (`review-rerun.yml` ONLY, `per_page=100`, `0` cancel
 //! calls).
 
+use std::cell::Cell;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use backon::{BlockingRetryable, ExponentialBuilder};
 use ci_core_model::store::{
@@ -21,6 +22,9 @@ use serde::Deserialize;
 use url::Url;
 
 const DEFAULT_GITHUB_API_BASE: &str = "https://api.github.com";
+
+/// Artifact downloads at least this large get a stderr line per attempt.
+const LARGE_DOWNLOAD_LOG_BYTES: u64 = 256 << 20;
 
 fn gh_retry_policy() -> ExponentialBuilder {
     ExponentialBuilder::default()
@@ -576,7 +580,10 @@ impl GitHubApi for HttpGitHubApi {
             self.api_base,
             self.slug.canonical()
         );
-        (|| {
+        // One download attempt. The clients' timeouts bound the wait for
+        // response headers and each read of the body, not the whole
+        // transfer, so multi-GiB artifacts need no per-request deadline.
+        let attempt_once = || {
             let mut req = self
                 .api_client
                 .get(&url)
@@ -647,6 +654,31 @@ impl GitHubApi for HttpGitHubApi {
             drop(f);
             fs::rename(&tmp_dest, dest)
                 .map_err(|e| AttemptErr::Fatal(GhApiError::Request(e.to_string())))
+        };
+        let attempt = Cell::new(0u32);
+        (|| {
+            attempt.set(attempt.get() + 1);
+            let t0 = Instant::now();
+            let res = attempt_once();
+            match &res {
+                Ok(()) => {
+                    let size = fs::metadata(dest).map_or(0, |m| m.len());
+                    if size >= LARGE_DOWNLOAD_LOG_BYTES {
+                        eprintln!(
+                            "github: artifact {artifact_id} ({:.1} MiB): download attempt {} took {:.1}s",
+                            size as f64 / (1024.0 * 1024.0),
+                            attempt.get(),
+                            t0.elapsed().as_secs_f64(),
+                        );
+                    }
+                }
+                Err(e) => eprintln!(
+                    "github: artifact {artifact_id}: download attempt {} failed after {:.1}s: {e:?}",
+                    attempt.get(),
+                    t0.elapsed().as_secs_f64(),
+                ),
+            }
+            res
         })
         .retry(gh_retry_policy())
         .when(|e| matches!(e, AttemptErr::Transient(_)))
