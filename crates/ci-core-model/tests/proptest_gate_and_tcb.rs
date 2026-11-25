@@ -1982,3 +1982,248 @@ fn canonical_tree_validated_preimages_and_branch_identity_invariants() {
     let action_pre = validated.action_preimage(&cfg, &chk_id).unwrap();
     assert_eq!(action_pre.check_id, chk_id);
 }
+
+/// A failed check on a publish-eligible push must be reported by name, and
+/// the PrePublish stage that `ci-core publish` runs before pushing or signing
+/// anything must reject it, so `publish` can run on failed shards without
+/// minting a reusable receipt for a failed check.
+#[test]
+fn evaluate_gate_names_failed_checks_and_prepublish_rejects_failed_execute() {
+    let toml = minimal_checks_toml("");
+    let config_path = RepoRelPath::new("ci/checks.toml").unwrap();
+    let cfg = ChecksConfig::parse_toml(&toml, &config_path).unwrap();
+    let cfg_sha = Sha256Digest::hash_bytes(toml.as_bytes());
+    let tree = minimal_repo_tree(&toml);
+    let validated = validate_config_against_tree(&cfg, &tree).unwrap();
+
+    let img_id = ImageId::new("base").unwrap();
+    let recipe_preimage = validated.image_recipe_preimage(&cfg, &img_id).unwrap();
+    let recipe = recipe_preimage.digest();
+    let img_manifest = Sha256Digest::hash_bytes(b"manifest-base-push");
+
+    let unit = CheckId::new("unit").unwrap();
+    let mut scheduled_checks = BTreeMap::new();
+    scheduled_checks.insert(
+        unit.clone(),
+        ScheduledCheckPlan {
+            check_id: unit.clone(),
+            image_id: img_id.clone(),
+            runner: "ubuntu-24.04".to_owned(),
+            sandbox: SandboxMode::Container,
+            shard_group: None,
+            action_preimage: validated.action_preimage(&cfg, &unit).unwrap(),
+            caches: BTreeMap::new(),
+        },
+    );
+    let mut images = BTreeMap::new();
+    images.insert(
+        img_id.clone(),
+        ImagePlan::PendingBuild {
+            recipe,
+            preimage: recipe_preimage.clone(),
+            runner: "ubuntu-24.04".to_owned(),
+            platform: Platform::LinuxAmd64,
+        },
+    );
+    let shards = pack_execute_shards(&scheduled_checks, &images).unwrap();
+    assert_eq!(shards.len(), 1);
+
+    let ev_sha = oid(C2);
+    let plan = ExecutionPlan {
+        plan_attempt: 1,
+        evaluated_at: UnixSecs(10_000),
+        mode: RunMode::Enforce,
+        event: TriggerEvent::Push,
+        runtime_ref: "refs/heads/main".to_owned(),
+        pr_base_ref: None,
+        event_sha: ev_sha,
+        second_parent: None,
+        publish_eligible: true,
+        needs_publish: true,
+        base_cfg_sha256: cfg_sha,
+        candidate_cfg_sha256: cfg_sha,
+        merge_group_chain_trees: None,
+        tcb: TcbPlan::NotRequired,
+        images,
+        pending_images: vec![PendingImageBuild {
+            recipe,
+            image_ids: NonEmptyVec::singleton(img_id),
+            runner: "ubuntu-24.04".to_owned(),
+            platform: Platform::LinuxAmd64,
+            preimage: recipe_preimage,
+        }],
+        reused_checks: BTreeMap::new(),
+        scheduled_checks: scheduled_checks.clone(),
+        shards,
+    };
+    let plan_bytes = serde_json::to_vec(&plan).unwrap();
+    let plan_sha = Sha256Digest::hash_bytes(&plan_bytes);
+
+    let mut built_images = BTreeMap::new();
+    built_images.insert(
+        recipe,
+        BuiltImageMeta {
+            plan_sha256: plan_sha,
+            attempt: 1,
+            recipe,
+            manifest: img_manifest,
+            verified_config_digest: Sha256Digest::hash_bytes(b"cfg"),
+        },
+    );
+    let shard_metas = |status: CheckExecStatus| {
+        let mut m = BTreeMap::new();
+        for sh in &plan.shards {
+            let outcomes = sh
+                .checks
+                .iter()
+                .map(|cid| CheckExecutionOutcome {
+                    check_id: cid.clone(),
+                    status,
+                    action: scheduled_checks[cid]
+                        .action_preimage
+                        .finalize(&img_manifest),
+                    outputs: BTreeMap::new(),
+                    hydrated_caches: Vec::new(),
+                    staged_caches: Vec::new(),
+                })
+                .collect();
+            m.insert(
+                sh.shard_index,
+                ShardMeta {
+                    plan_sha256: plan_sha,
+                    attempt: 1,
+                    shard_index: sh.shard_index,
+                    outcomes,
+                    bundles: BTreeMap::new(),
+                },
+            );
+        }
+        m
+    };
+    let observed_run = WorkflowRunMeta {
+        path: ".github/workflows/ci.yml".to_owned(),
+        workflow_id: 55,
+        is_org_required_workflow: false,
+        referenced_workflows: vec![ReferencedWorkflow {
+            path: format!("joshlf/ci-core/.github/workflows/ci.yml@{S1}"),
+            sha: oid(S1),
+            ref_str: None,
+        }],
+    };
+    let jobs = |execute, publish| ObservedJobResults {
+        plan: UpstreamJobResult::Success,
+        build_images: UpstreamJobResult::Success,
+        execute,
+        publish,
+    };
+    let run = |stage, jobs, shard_outcomes: &BTreeMap<u32, ShardMeta>| {
+        evaluate_gate(
+            stage,
+            false,
+            UnixSecs(10_100),
+            "google/demo",
+            100,
+            TriggerEvent::Push,
+            "refs/heads/main",
+            None,
+            ev_sha,
+            None,
+            None,
+            false,
+            false,
+            false,
+            &cfg,
+            &cfg,
+            cfg_sha,
+            Ok(()),
+            Ok(()),
+            Ok(()),
+            &[],
+            &[],
+            true,
+            &observed_run,
+            jobs,
+            &plan_bytes,
+            plan_sha,
+            &plan,
+            &BTreeMap::new(),
+            &built_images,
+            shard_outcomes,
+            &BTreeMap::new(),
+        )
+    };
+
+    // Baseline: the fixture is a valid passing push run at both stages, so
+    // the rejections below are caused by the failed check alone.
+    let passed = shard_metas(CheckExecStatus::Passed);
+    assert!(matches!(
+        run(
+            EvalStage::PrePublish,
+            jobs(UpstreamJobResult::Success, UpstreamJobResult::Skipped),
+            &passed,
+        ),
+        Ok(GatePass::ReadyToPublish { .. })
+    ));
+    assert_eq!(
+        run(
+            EvalStage::FinalGate,
+            jobs(UpstreamJobResult::Success, UpstreamJobResult::Success),
+            &passed,
+        ),
+        Ok(GatePass::Enforced)
+    );
+
+    // PrePublish (what `ci-core publish` runs before any registry push or
+    // signature) rejects a failed `execute` and names the failed check.
+    let failed = shard_metas(CheckExecStatus::Failed);
+    let expect_failed_unit = |res: Result<GatePass, GateError>| match res {
+        Err(GateError::Clause3(msg)) => {
+            assert!(
+                msg.contains("jobs.execute Failure") && msg.contains("failed checks: unit"),
+                "unexpected Clause 3 message: {msg}"
+            );
+        }
+        other => panic!("expected Clause 3 rejection, got {other:?}"),
+    };
+    expect_failed_unit(run(
+        EvalStage::PrePublish,
+        jobs(UpstreamJobResult::Failure, UpstreamJobResult::Skipped),
+        &failed,
+    ));
+
+    // FinalGate after `publish` ran (and failed or, under job-level
+    // `continue-on-error`, reported success) reports the failed check.
+    for publish in [UpstreamJobResult::Failure, UpstreamJobResult::Success] {
+        expect_failed_unit(run(
+            EvalStage::FinalGate,
+            jobs(UpstreamJobResult::Failure, publish),
+            &failed,
+        ));
+    }
+
+    // A shard that errored before writing metadata is named as missing.
+    match run(
+        EvalStage::FinalGate,
+        jobs(UpstreamJobResult::Failure, UpstreamJobResult::Failure),
+        &BTreeMap::new(),
+    ) {
+        Err(GateError::Clause3(msg)) => {
+            assert!(
+                msg.contains("shards without metadata: [0]"),
+                "unexpected Clause 3 message: {msg}"
+            );
+        }
+        other => panic!("expected Clause 3 rejection, got {other:?}"),
+    }
+
+    // Even if `execute` were misreported as Success, a Failed outcome is
+    // still rejected at PrePublish, before anything is signed.
+    assert!(matches!(
+        run(
+            EvalStage::PrePublish,
+            jobs(UpstreamJobResult::Success, UpstreamJobResult::Skipped),
+            &failed,
+        ),
+        Err(GateError::Clause6(_))
+    ));
+}

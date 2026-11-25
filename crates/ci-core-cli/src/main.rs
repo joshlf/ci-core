@@ -2176,6 +2176,23 @@ fn cmd_publish(
         return Err("unexpected GatePass variant for PrePublish".to_owned());
     };
 
+    // `publish` also runs when `execute` failed, so the gate can report the
+    // failed checks. `evaluate_gate` already rejects that case (Clause 3
+    // requires `execute == Success`, Clause 6 requires every outcome to be
+    // `Passed`), but the loops below stage a `Claim::Check` for every outcome
+    // without looking at its status. Check again here so a failed check can
+    // never be signed as a reusable receipt, even if the gate changes.
+    if let Some(out) = shard_outcomes
+        .values()
+        .flat_map(|smeta| &smeta.outcomes)
+        .find(|out| out.status != CheckExecStatus::Passed)
+    {
+        return Err(format!(
+            "refusing to publish: check `{}` did not pass",
+            out.check_id
+        ));
+    }
+
     let eff_cp =
         resolve_effective_control_plane(&live_cfg, &plan.tcb).map_err(|e| e.to_string())?;
     let api = HttpGitHubApi::new(live_cfg.repo.slug.clone(), gh_token_from_env(), None)

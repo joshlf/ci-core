@@ -464,7 +464,10 @@ jobs:
           "$BIN_DIR/ci-core" "${ARGS[@]}"
           rm -rf "$RUNNER_TEMP/ci-core-bare.git" "$RUNNER_TEMP/img-blob-in"
 
+      # Upload metadata even when a check failed so the gate can name
+      # the failed checks.
       - name: Upload shard metadata artifact
+        if: ${{ !cancelled() && steps.exec.outcome != 'skipped' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: shard-meta-a${{ github.run_attempt }}-${{ matrix.shard_index }}

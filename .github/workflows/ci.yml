@@ -466,7 +466,12 @@ jobs:
           "$BIN_DIR/ci-core" "${ARGS[@]}"
           rm -rf "$RUNNER_TEMP/ci-core-bare.git" "$RUNNER_TEMP/img-blob-in"
 
+      # Upload metadata even when a check failed: the gate needs one
+      # record per planned shard to name the failed checks. Shard blobs
+      # stay gated on `has_shard_blob`, which is only set when every
+      # check in the shard passed.
       - name: Upload shard metadata artifact
+        if: ${{ !cancelled() && steps.exec.outcome != 'skipped' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: shard-meta-a${{ github.run_attempt }}-${{ matrix.shard_index }}
@@ -489,15 +494,18 @@ jobs:
         shell: sh
         run: rm -rf "$RUNNER_TEMP/shard-meta-out" "$RUNNER_TEMP/shard-blob-out" "$RUNNER_TEMP/img-blob-in"
 
+  # `publish` runs whenever the plan has pending work, even if
+  # `build-images` or `execute` failed. The gate expects `publish` to
+  # have run in that case, and `ci-core publish` re-evaluates the gate
+  # (PrePublish) before pushing or signing anything, so a failed
+  # upstream job makes it fail without side effects.
   publish:
     name: publish
     needs: [plan, build-images, execute]
     if: >-
       !cancelled() &&
       needs.plan.outputs.needs_publish == 'true' &&
-      needs.plan.result == 'success' &&
-      (needs.build-images.result == 'success' || needs.build-images.result == 'skipped') &&
-      (needs.execute.result == 'success' || needs.execute.result == 'skipped')
+      needs.plan.result == 'success'
     runs-on: ubuntu-24.04
     continue-on-error: true
     timeout-minutes: 60

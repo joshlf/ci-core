@@ -1020,6 +1020,41 @@ pub fn compute_gc_keep_tags(plan: &ExecutionPlan) -> BTreeSet<LookupTag> {
     keep
 }
 
+/// Names the checks that explain an unexpected `execute` result, for the
+/// Clause 3 rejection message.
+///
+/// When a shard fails a check, `execute` is `Failure` and Clause 3 rejects the
+/// run before Clause 6 looks at individual outcomes. Without this suffix the
+/// gate would report only the job result and hide which checks failed. The
+/// listed outcomes come from shard metadata and are used only to describe a
+/// rejection, never to accept a run. A shard missing from the list of reported
+/// shards most likely errored before it could write its metadata.
+fn describe_execute_failures(
+    plan: &ExecutionPlan,
+    shard_outcomes: &BTreeMap<u32, ShardMeta>,
+) -> String {
+    let failed: Vec<&str> = shard_outcomes
+        .values()
+        .flat_map(|smeta| &smeta.outcomes)
+        .filter(|out| out.status != CheckExecStatus::Passed)
+        .map(|out| out.check_id.as_str())
+        .collect();
+    let missing: Vec<u32> = plan
+        .shards
+        .iter()
+        .map(|sh| sh.shard_index)
+        .filter(|idx| !shard_outcomes.contains_key(idx))
+        .collect();
+    let mut msg = String::new();
+    if !failed.is_empty() {
+        msg.push_str(&format!("; failed checks: {}", failed.join(", ")));
+    }
+    if !missing.is_empty() {
+        msg.push_str(&format!("; shards without metadata: {missing:?}"));
+    }
+    msg
+}
+
 /// Literal 7-clause compile-time-offline `GateAccepts` evaluator (`§6.3`).
 ///
 /// Accepts neither `Registry` nor `GitHubApi`, making network I/O inside gate
@@ -1347,8 +1382,10 @@ pub fn evaluate_gate(
         };
         if jobs.execute != expected_ex {
             return Err(GateError::Clause3(format!(
-                "jobs.execute {:?} != expected {:?}",
-                jobs.execute, expected_ex
+                "jobs.execute {:?} != expected {:?}{}",
+                jobs.execute,
+                expected_ex,
+                describe_execute_failures(plan, shard_outcomes)
             )));
         }
     }
