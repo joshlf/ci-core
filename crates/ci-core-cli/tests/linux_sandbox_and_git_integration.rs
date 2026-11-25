@@ -273,6 +273,275 @@ fn o6_verify_oci_layout_unwraps_index_strips_docker_manifest_json_and_rejects_ex
     );
 }
 
+/// Legacy v1 image JSON that Docker 28.0.4's classic-store `docker save`
+/// writes for the bottom layer of any image built `FROM`
+/// `ubuntu:24.04@sha256:9a04f13b…` (amd64, layer diff ID
+/// `sha256:369ede38…`). Its SHA-256 is the `64b3cae2…` blob that four
+/// different x86-64 `build-image` jobs reported as unexpected.
+const DOCKER28_UBUNTU2404_AMD64_LAYER0_V1_JSON: &[u8] = br#"{"id":"e7faef61ec7c9315d70cd9ef86ad5c3989eb698a2b318b27824c09d500d532b8","created":"1970-01-01T00:00:00Z","container_config":{"Hostname":"","Domainname":"","User":"","AttachStdin":false,"AttachStdout":false,"AttachStderr":false,"Tty":false,"OpenStdin":false,"StdinOnce":false,"Env":null,"Cmd":null,"Image":"","Volumes":null,"WorkingDir":"","Entrypoint":null,"OnBuild":null,"Labels":null},"os":"linux"}"#;
+
+struct ClassicDockerSave {
+    _td: tempfile::TempDir,
+    layout: PathBuf,
+    manifest_sha: Sha256Digest,
+    cfg_sha: Sha256Digest,
+    layer_shas: Vec<Sha256Digest>,
+    legacy_v1_shas: Vec<Sha256Digest>,
+}
+
+/// Writes the directory shape that `docker save` produces on Docker
+/// 28.0.4 with the classic image store (GitHub `ubuntu-24.04` runners):
+/// `index.json` naming one OCI manifest (with image-name annotations),
+/// uncompressed layer blobs, the config blob, `manifest.json`,
+/// `repositories`, and one unreferenced legacy v1 JSON blob per layer.
+fn write_docker28_classic_save_layout() -> ClassicDockerSave {
+    let td = tempfile::tempdir().unwrap();
+    let layout = td.path().join("oci");
+    let blobs = layout.join("blobs/sha256");
+    fs::create_dir_all(&blobs).unwrap();
+    fs::write(
+        layout.join("oci-layout"),
+        br#"{"imageLayoutVersion": "1.0.0"}"#,
+    )
+    .unwrap();
+
+    let put = |bytes: &[u8]| {
+        let sha = Sha256Digest::hash_bytes(bytes);
+        fs::write(blobs.join(sha.to_hex()), bytes).unwrap();
+        sha
+    };
+
+    let layers: [&[u8]; 3] = [b"base-layer-tar", b"apt-layer-tar", b"rustup-layer-tar"];
+    let layer_shas: Vec<Sha256Digest> = layers.iter().map(|l| put(l)).collect();
+
+    let diff_ids: Vec<String> = layer_shas.iter().map(Sha256Digest::to_oci_digest).collect();
+    let cfg_bytes = serde_json::to_vec(&serde_json::json!({
+        "architecture": "amd64",
+        "os": "linux",
+        "config": {"Env": ["PATH=/usr/local/cargo/bin:/usr/bin"]},
+        "rootfs": {"type": "layers", "diff_ids": diff_ids},
+    }))
+    .unwrap();
+    let cfg_sha = put(&cfg_bytes);
+
+    let layer_descs: Vec<serde_json::Value> = layers
+        .iter()
+        .zip(&layer_shas)
+        .map(|(bytes, sha)| {
+            serde_json::json!({
+                "mediaType": "application/vnd.oci.image.layer.v1.tar",
+                "digest": sha.to_oci_digest(),
+                "size": bytes.len(),
+            })
+        })
+        .collect();
+    let manifest = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": cfg_sha.to_oci_digest(),
+            "size": cfg_bytes.len(),
+        },
+        "layers": layer_descs,
+    }))
+    .unwrap();
+    let manifest_sha = put(&manifest);
+
+    let mut legacy_v1_shas = vec![put(DOCKER28_UBUNTU2404_AMD64_LAYER0_V1_JSON)];
+    for (i, parent) in ["e7faef61", "a1b2c3d4"].iter().enumerate() {
+        let v1 = format!(
+            r#"{{"id":"layer{i}","parent":"{parent}","created":"1970-01-01T00:00:00Z","os":"linux"}}"#
+        );
+        legacy_v1_shas.push(put(v1.as_bytes()));
+    }
+
+    fs::write(
+        layout.join("index.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [{
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": manifest_sha.to_oci_digest(),
+                "size": manifest.len(),
+                "annotations": {
+                    "io.containerd.image.name": "docker.io/library/ci-core-build:8866daca336bd3c5",
+                    "org.opencontainers.image.ref.name": "8866daca336bd3c5",
+                },
+            }],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let layer_paths: Vec<String> = layer_shas
+        .iter()
+        .map(|s| format!("blobs/sha256/{}", s.to_hex()))
+        .collect();
+    fs::write(
+        layout.join("manifest.json"),
+        serde_json::to_vec(&serde_json::json!([{
+            "Config": format!("blobs/sha256/{}", cfg_sha.to_hex()),
+            "RepoTags": ["ci-core-build:8866daca336bd3c5"],
+            "Layers": layer_paths,
+        }]))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        layout.join("repositories"),
+        br#"{"ci-core-build":{"8866daca336bd3c5":"e7faef61"}}"#,
+    )
+    .unwrap();
+
+    ClassicDockerSave {
+        _td: td,
+        layout,
+        manifest_sha,
+        cfg_sha,
+        layer_shas,
+        legacy_v1_shas,
+    }
+}
+
+fn layout_files(layout: &Path) -> BTreeSet<String> {
+    fn walk(root: &Path, cur: &Path, out: &mut BTreeSet<String>) {
+        for ent in fs::read_dir(cur).unwrap() {
+            let p = ent.unwrap().path();
+            if p.is_dir() {
+                walk(root, &p, out);
+            } else {
+                out.insert(p.strip_prefix(root).unwrap().to_str().unwrap().to_owned());
+            }
+        }
+    }
+    let mut out = BTreeSet::new();
+    walk(layout, layout, &mut out);
+    out
+}
+
+#[test]
+fn o6_normalize_prunes_docker28_classic_store_legacy_v1_layer_blobs() {
+    let s = write_docker28_classic_save_layout();
+    assert_eq!(
+        s.legacy_v1_shas[0].to_hex(),
+        "64b3cae297e41b0aeb2d25fa75f42e1d13a82f01df5bcafeacdb2a750340fc9d",
+        "fixture must reproduce the legacy blob seen on real runners"
+    );
+    // The unpruned layout is exactly what failed on the runners.
+    assert!(verify_oci_layout(&s.layout, &s.manifest_sha).is_err());
+
+    let norm = normalize_docker_save_to_pure_oci(&s.layout).unwrap();
+    assert_eq!(norm.manifest_digest, s.manifest_sha);
+    assert_eq!(norm.verified_config_digest, s.cfg_sha);
+    assert_eq!(
+        norm.config_env,
+        vec!["PATH=/usr/local/cargo/bin:/usr/bin".to_owned()]
+    );
+    let content: Vec<Sha256Digest> = norm.content_blobs.iter().map(|(d, _)| *d).collect();
+    let mut want = vec![s.cfg_sha];
+    want.extend(&s.layer_shas);
+    assert_eq!(content, want);
+
+    let mut expected: BTreeSet<String> = ["oci-layout", "index.json"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    for d in std::iter::once(&s.manifest_sha)
+        .chain(std::iter::once(&s.cfg_sha))
+        .chain(&s.layer_shas)
+    {
+        expected.insert(format!("blobs/sha256/{}", d.to_hex()));
+    }
+    assert_eq!(layout_files(&s.layout), expected);
+
+    // The pruned layout passes the strict verifier used by every consumer.
+    verify_oci_layout(&s.layout, &s.manifest_sha).unwrap();
+}
+
+#[test]
+fn o6_normalize_still_rejects_malformed_docker_save_layouts() {
+    type Mutate = fn(&ClassicDockerSave);
+    let blob = |s: &ClassicDockerSave, name: &str| s.layout.join("blobs/sha256").join(name);
+    let cases: [(&str, Mutate); 7] = [
+        ("unreferenced symlink blob", |s| {
+            let target = s.layout.join("blobs/sha256").join(s.layer_shas[0].to_hex());
+            let name = Sha256Digest::hash_bytes(b"link").to_hex();
+            symlink(target, s.layout.join("blobs/sha256").join(name)).unwrap();
+        }),
+        ("directory inside blobs/sha256", |s| {
+            let dir = s
+                .layout
+                .join("blobs/sha256")
+                .join(Sha256Digest::hash_bytes(b"dir").to_hex());
+            fs::create_dir(&dir).unwrap();
+            fs::write(dir.join("payload"), b"x").unwrap();
+        }),
+        ("non-hex file in blobs/sha256", |s| {
+            fs::write(s.layout.join("blobs/sha256/not-a-digest"), b"x").unwrap();
+        }),
+        ("blob under another algorithm", |s| {
+            fs::create_dir_all(s.layout.join("blobs/sha512")).unwrap();
+            fs::write(s.layout.join("blobs/sha512/abcd"), b"x").unwrap();
+        }),
+        ("stray top-level file", |s| {
+            fs::write(s.layout.join("extra"), b"x").unwrap();
+        }),
+        ("tampered referenced layer", |s| {
+            let p = s.layout.join("blobs/sha256").join(s.layer_shas[1].to_hex());
+            fs::write(p, b"evil-layer-tar").unwrap();
+        }),
+        ("second index.json entry", |s| {
+            let p = s.layout.join("index.json");
+            let mut idx: serde_json::Value =
+                serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
+            let first = idx["manifests"][0].clone();
+            idx["manifests"].as_array_mut().unwrap().push(first);
+            fs::write(p, serde_json::to_vec(&idx).unwrap()).unwrap();
+        }),
+    ];
+    for (what, mutate) in cases {
+        let s = write_docker28_classic_save_layout();
+        mutate(&s);
+        assert!(
+            normalize_docker_save_to_pure_oci(&s.layout).is_err(),
+            "O6: normalize must fail closed on {what}"
+        );
+        // Referenced content is never pruned away by a failed normalize.
+        assert!(blob(&s, &s.manifest_sha.to_hex()).exists(), "{what}");
+    }
+}
+
+#[test]
+fn o6_normalize_never_prunes_through_symlinked_blob_dirs() {
+    for link_level in ["blobs", "blobs/sha256"] {
+        let s = write_docker28_classic_save_layout();
+        let outside = s
+            .layout
+            .parent()
+            .unwrap()
+            .join(format!("outside-{}", link_level.replace('/', "-")));
+        let moved = s.layout.join(link_level);
+        fs::rename(&moved, &outside).unwrap();
+        symlink(&outside, &moved).unwrap();
+        let legacy_rel = s.legacy_v1_shas[0].to_hex();
+        let legacy_outside = if link_level == "blobs" {
+            outside.join("sha256").join(&legacy_rel)
+        } else {
+            outside.join(&legacy_rel)
+        };
+        assert!(legacy_outside.exists());
+        assert!(
+            normalize_docker_save_to_pure_oci(&s.layout).is_err(),
+            "O6: normalize must reject a symlinked `{link_level}`"
+        );
+        assert!(
+            legacy_outside.exists(),
+            "O6: normalize must not unlink through a symlinked `{link_level}`"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 3. Real `/usr/bin/bwrap` NestedBwrap Confinement (`EROFS`, `CLONE_NEWNET`,
 //    Inner `bwrap --unshare-all`, Writable Overlay, Env Stripping & Outputs)

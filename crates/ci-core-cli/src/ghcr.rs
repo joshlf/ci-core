@@ -308,11 +308,63 @@ pub fn verify_oci_layout(
     })
 }
 
+/// Deletes every regular file directly under `blobs/sha256/` whose name is
+/// not the hex digest of a blob in `referenced`.
+///
+/// Only plain files with canonical 64-hex names are removed. Symlinks,
+/// directories, other digest algorithms, and oddly named files are left in
+/// place so that `verify_oci_layout` still rejects them; pruning must never
+/// turn a malformed layout into an accepted one.
+fn prune_unreferenced_sha256_blobs(
+    layout_dir: &Path,
+    referenced: &BTreeSet<Sha256Digest>,
+) -> Result<(), StoreError> {
+    let keep: BTreeSet<String> = referenced.iter().map(Sha256Digest::to_hex).collect();
+    let blobs_root = layout_dir.join("blobs");
+    let blob_dir = blobs_root.join("sha256");
+    // Refuse to list or unlink through a symlinked directory, which could
+    // point outside `layout_dir`.
+    for dir in [&blobs_root, &blob_dir] {
+        let meta =
+            fs::symlink_metadata(dir).map_err(|e| StoreError::InvalidFormat(e.to_string()))?;
+        if !meta.file_type().is_dir() {
+            return Err(StoreError::DigestMismatch(format!(
+                "`{}` is not a real directory",
+                dir.display()
+            )));
+        }
+    }
+    let rd = fs::read_dir(&blob_dir).map_err(|e| StoreError::InvalidFormat(e.to_string()))?;
+    for ent_res in rd {
+        let ent = ent_res.map_err(|e| StoreError::InvalidFormat(e.to_string()))?;
+        let Some(name) = ent.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if keep.contains(&name) || Sha256Digest::from_hex(&name).is_err() {
+            continue;
+        }
+        let path = ent.path();
+        let meta =
+            fs::symlink_metadata(&path).map_err(|e| StoreError::InvalidFormat(e.to_string()))?;
+        if meta.file_type().is_file() {
+            fs::remove_file(&path).map_err(|e| StoreError::InvalidFormat(e.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
 /// Normalizes a raw `docker save` directory into a pure single-platform OCI
 /// Image Layout (`Obligation O6`): strips `manifest.json` and `repositories`,
 /// unwraps any nested single-entry OCI Image Index so `index.json` references
-/// `M = manifests[0]` directly, prunes unreferenced outer-index blobs, and
-/// validates the result with `verify_oci_layout`.
+/// `M = manifests[0]` directly, prunes every `blobs/sha256` file that `M`
+/// does not reference, and validates the result with `verify_oci_layout`.
+///
+/// Pruning is required because `docker save` emits blobs that no manifest
+/// references. With the classic (non-containerd) image store, Docker writes
+/// one legacy v1 image JSON per layer into `blobs/sha256/` alongside the
+/// OCI blobs; the containerd store leaves the outer index blob behind once
+/// we unwrap it. Dropping such files cannot weaken `O6`: the packed layout
+/// still holds only `M`, its config, and its layers, each hash-verified.
 pub fn normalize_docker_save_to_pure_oci(
     layout_dir: &Path,
 ) -> Result<VerifiedOciLayout, StoreError> {
@@ -349,13 +401,6 @@ pub fn normalize_docker_save_to_pure_oci(
             )));
         }
         entry = nested.manifests.remove(0);
-        // Remove the outer index blob so only the single-platform manifest,
-        // config, and layers remain.
-        let outer_blob_path = layout_dir
-            .join("blobs")
-            .join("sha256")
-            .join(outer_digest.to_hex());
-        let _ = fs::remove_file(outer_blob_path);
         let rewritten = OciIndexDoc {
             schema_version: 2,
             media_type: Some(OCI_IMAGE_INDEX_MEDIA_TYPE.to_owned()),
@@ -374,6 +419,20 @@ pub fn normalize_docker_save_to_pure_oci(
 
     let expected_m = Sha256Digest::from_oci_digest(&entry.digest)
         .map_err(|e| StoreError::DigestMismatch(e.to_string()))?;
+    let (manifest_bytes, _) =
+        read_verified_blob_in_layout(layout_dir, &expected_m, Some(entry.size))?;
+    let manifest_doc: OciImageManifestDoc = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| StoreError::InvalidFormat(format!("invalid OCI image manifest: {e}")))?;
+    let mut referenced = BTreeSet::new();
+    referenced.insert(expected_m);
+    for desc in std::iter::once(&manifest_doc.config).chain(&manifest_doc.layers) {
+        referenced.insert(
+            Sha256Digest::from_oci_digest(&desc.digest)
+                .map_err(|e| StoreError::DigestMismatch(e.to_string()))?,
+        );
+    }
+    prune_unreferenced_sha256_blobs(layout_dir, &referenced)?;
+
     verify_oci_layout(layout_dir, &expected_m)
 }
 
