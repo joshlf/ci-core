@@ -413,9 +413,8 @@ impl GitHubApi for HttpGitHubApi {
                     pageInfo { hasNextPage endCursor }
                     nodes {
                       state
-                      headCommit { oid }
                       baseCommit { oid }
-                      pullRequest { number }
+                      pullRequest { number headRefOid }
                     }
                   }
                 }
@@ -454,43 +453,7 @@ impl GitHubApi for HttpGitHubApi {
                     if node.is_null() {
                         continue;
                     }
-                    let pr_number = node
-                        .pointer("/pullRequest/number")
-                        .and_then(serde_json::Value::as_u64)
-                        .ok_or_else(|| {
-                            GhApiError::Request("mergeQueue entry missing PR number".to_owned())
-                        })?;
-                    let head_s = node
-                        .pointer("/headCommit/oid")
-                        .and_then(serde_json::Value::as_str)
-                        .ok_or_else(|| {
-                            GhApiError::Request(
-                                "mergeQueue entry missing headCommit.oid".to_owned(),
-                            )
-                        })?;
-                    let head_oid =
-                        GitOid::from_hex(head_s).map_err(|e| GhApiError::Request(e.to_string()))?;
-                    let base_oid = node
-                        .pointer("/baseCommit/oid")
-                        .and_then(serde_json::Value::as_str)
-                        .and_then(|s| GitOid::from_hex(s).ok());
-                    let state_s = node
-                        .get("state")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("QUEUED");
-                    let state = match state_s {
-                        "LOCKED" => MergeQueueEntryState::Locked,
-                        "AWAITING_CHECKS" => MergeQueueEntryState::AwaitingChecks,
-                        "MERGEABLE" => MergeQueueEntryState::Mergeable,
-                        "UNMERGEABLE" => MergeQueueEntryState::Unmergeable,
-                        _ => MergeQueueEntryState::Queued,
-                    };
-                    entries.push(MergeQueueEntry {
-                        pr_number,
-                        head_oid,
-                        base_oid,
-                        state,
-                    });
+                    entries.push(parse_merge_queue_entry(node)?);
                 }
             }
 
@@ -934,6 +897,49 @@ impl GitHubRerunClient {
     }
 }
 
+/// Parses one GraphQL `MergeQueueEntry` node.
+///
+/// `head_oid` is the pull request's head commit (`pullRequest.headRefOid`),
+/// the commit that owner approvals are bound to and that merge-queue replay
+/// re-merges onto the chain. It is deliberately not the entry's
+/// `headCommit`, which is the merge-group commit GitHub created: replaying
+/// that commit onto its own parent matches trivially, and no review is ever
+/// bound to it.
+fn parse_merge_queue_entry(node: &serde_json::Value) -> Result<MergeQueueEntry, GhApiError> {
+    let pr_number = node
+        .pointer("/pullRequest/number")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| GhApiError::Request("mergeQueue entry missing PR number".to_owned()))?;
+    let head_s = node
+        .pointer("/pullRequest/headRefOid")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            GhApiError::Request("mergeQueue entry missing pullRequest.headRefOid".to_owned())
+        })?;
+    let head_oid = GitOid::from_hex(head_s).map_err(|e| GhApiError::Request(e.to_string()))?;
+    let base_oid = node
+        .pointer("/baseCommit/oid")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|s| GitOid::from_hex(s).ok());
+    let state = match node
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("QUEUED")
+    {
+        "LOCKED" => MergeQueueEntryState::Locked,
+        "AWAITING_CHECKS" => MergeQueueEntryState::AwaitingChecks,
+        "MERGEABLE" => MergeQueueEntryState::Mergeable,
+        "UNMERGEABLE" => MergeQueueEntryState::Unmergeable,
+        _ => MergeQueueEntryState::Queued,
+    };
+    Ok(MergeQueueEntry {
+        pr_number,
+        head_oid,
+        base_oid,
+        state,
+    })
+}
+
 /// Percent-encodes every byte of `segment` outside the RFC 3986 unreserved
 /// set, so a branch name is a single URL path segment.
 fn percent_encode_path_segment(segment: &str) -> String {
@@ -1046,5 +1052,30 @@ mod merge_method_tests {
             "release%2Fv1.x"
         );
         assert_eq!(percent_encode_path_segment("a b?#"), "a%20b%3F%23");
+    }
+
+    #[test]
+    fn merge_queue_entry_uses_pull_request_head_not_merge_group_commit() {
+        let pr_head = "3c5a8eb70867294cbe0670472678395d7da5a929";
+        let node = serde_json::json!({
+            "state": "AWAITING_CHECKS",
+            "headCommit": { "oid": "919e90db222179c7884602a7c613bbd39235a0cd" },
+            "baseCommit": { "oid": "5f003db450e7c5253fe3606f2ebbd3058a34b1b1" },
+            "pullRequest": { "number": 4320, "headRefOid": pr_head },
+        });
+        let e = parse_merge_queue_entry(&node).unwrap();
+        assert_eq!(e.pr_number, 4320);
+        assert_eq!(e.head_oid, GitOid::from_hex(pr_head).unwrap());
+        assert_eq!(e.state, MergeQueueEntryState::AwaitingChecks);
+        assert_eq!(
+            e.base_oid,
+            Some(GitOid::from_hex("5f003db450e7c5253fe3606f2ebbd3058a34b1b1").unwrap())
+        );
+
+        let missing = serde_json::json!({
+            "headCommit": { "oid": "919e90db222179c7884602a7c613bbd39235a0cd" },
+            "pullRequest": { "number": 4320 },
+        });
+        assert!(parse_merge_queue_entry(&missing).is_err());
     }
 }

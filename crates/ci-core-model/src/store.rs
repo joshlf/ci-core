@@ -233,7 +233,8 @@ pub enum MergeQueueEntryState {
 pub struct MergeQueueEntry {
     /// Pull request number.
     pub pr_number: u64,
-    /// PR head commit OID (`headCommit.oid`).
+    /// PR head commit OID (`pullRequest.headRefOid`), not the merge-group
+    /// commit that GitHub reports as the entry's `headCommit`.
     pub head_oid: GitOid,
     /// PR base commit OID (`baseCommit.oid`, if reported).
     pub base_oid: Option<GitOid>,
