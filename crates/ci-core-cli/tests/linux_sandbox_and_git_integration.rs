@@ -16,6 +16,7 @@ use ci_core_cli::sandbox::{
     ContainerRuntime, SandboxLaunchSpec, build_sandbox_env, capture_declared_outputs,
     extract_tar_stripping_special, hydrate_cache_archive, pack_cache_archive, resolve_bwrap_binary,
     run_cargo_locked_fetch_native, run_nested_bwrap_sandbox, verify_bwrap_userns_preflight,
+    write_docker_load_tar,
 };
 use ci_core_cli::signer::{StagedClaim, commit_claims_bottom_up, validate_actions_oidc_jwt_claims};
 use ci_core_model::cargo_static::audit_cargo_locked;
@@ -456,6 +457,57 @@ fn o6_normalize_prunes_docker28_classic_store_legacy_v1_layer_blobs() {
     assert_eq!(layout_files(&s.layout), expected);
 
     // The pruned layout passes the strict verifier used by every consumer.
+    verify_oci_layout(&s.layout, &s.manifest_sha).unwrap();
+}
+
+#[test]
+fn o6_docker_load_stream_carries_manifest_json_for_classic_store() {
+    let s = write_docker28_classic_save_layout();
+    let verified = normalize_docker_save_to_pure_oci(&s.layout).unwrap();
+    let mj = verified.docker_load_manifest_json().unwrap();
+
+    // Apply the checks Docker 28's classic `docker load` makes on a
+    // `manifest.json` entry, and confirm the image ID it would assign.
+    let items: Vec<serde_json::Value> = serde_json::from_slice(&mj).unwrap();
+    assert_eq!(items.len(), 1);
+    let item = &items[0];
+    assert_eq!(item["RepoTags"], serde_json::json!([]));
+    let cfg_bytes = fs::read(s.layout.join(item["Config"].as_str().unwrap())).unwrap();
+    assert_eq!(Sha256Digest::hash_bytes(&cfg_bytes), s.cfg_sha);
+    let cfg: serde_json::Value = serde_json::from_slice(&cfg_bytes).unwrap();
+    let diff_ids = cfg["rootfs"]["diff_ids"].as_array().unwrap();
+    let layers = item["Layers"].as_array().unwrap();
+    assert_eq!(layers.len(), diff_ids.len());
+    for (layer, diff_id) in layers.iter().zip(diff_ids) {
+        let bytes = fs::read(s.layout.join(layer.as_str().unwrap())).unwrap();
+        assert_eq!(
+            Sha256Digest::hash_bytes(&bytes).to_oci_digest(),
+            diff_id.as_str().unwrap()
+        );
+    }
+
+    // The stream holds the verified layout plus `manifest.json`; the
+    // on-disk layout stays pure OCI.
+    let tar_bytes = write_docker_load_tar(&s.layout, &mj, Vec::new()).unwrap();
+    let mut archive = tar::Archive::new(tar_bytes.as_slice());
+    let mut streamed = BTreeSet::new();
+    for ent in archive.entries().unwrap() {
+        let mut ent = ent.unwrap();
+        if !ent.header().entry_type().is_file() {
+            continue;
+        }
+        let path = ent.path().unwrap().to_str().unwrap().to_owned();
+        if path == "manifest.json" {
+            let mut got = Vec::new();
+            std::io::Read::read_to_end(&mut ent, &mut got).unwrap();
+            assert_eq!(got, mj);
+        }
+        streamed.insert(path);
+    }
+    let mut expected = layout_files(&s.layout);
+    assert!(!expected.contains("manifest.json"));
+    expected.insert("manifest.json".to_owned());
+    assert_eq!(streamed, expected);
     verify_oci_layout(&s.layout, &s.manifest_sha).unwrap();
 }
 

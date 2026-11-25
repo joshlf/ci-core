@@ -1461,8 +1461,7 @@ fn cmd_execute(
 
     // Load into Docker using exact `sha256:<verified_config_digest>` (`O6`).
     let loaded_image_id =
-        docker_load_verified_oci_layout(&oci_dir, &verified_layout.verified_config_digest)
-            .map_err(|e| e.to_string())?;
+        docker_load_verified_oci_layout(&oci_dir, &verified_layout).map_err(|e| e.to_string())?;
     let _ = fs::remove_dir_all(&oci_dir);
 
     let shard_uses_cargo_locked = shard.checks.iter().any(|cid| {
@@ -2945,8 +2944,8 @@ fn cmd_run_local(
                 .is_ok()
         {
             let vl = verify_oci_layout(&oci_dir, manifest).map_err(|e| e.to_string())?;
-            loaded_image_id = docker_load_verified_oci_layout(&oci_dir, &vl.verified_config_digest)
-                .map_err(|e| e.to_string())?;
+            loaded_image_id =
+                docker_load_verified_oci_layout(&oci_dir, &vl).map_err(|e| e.to_string())?;
             let _ = fs::remove_dir_all(&oci_dir);
             if let Some(ref croot) = host_cache {
                 let imgs_dir = croot.join("images");

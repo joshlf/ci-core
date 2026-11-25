@@ -95,6 +95,38 @@ pub struct VerifiedOciLayout {
     pub content_blobs: Vec<(Sha256Digest, u64)>,
 }
 
+impl VerifiedOciLayout {
+    /// Returns a Docker-archive `manifest.json` describing this image,
+    /// for adding to the `docker load` input stream only.
+    ///
+    /// Docker's classic image store loads only archives that carry
+    /// `manifest.json`; given a pure OCI layout it falls back to the
+    /// pre-1.10 format and fails reading `blobs/json`. The entry points
+    /// at the verified config and the manifest's layers in order, so
+    /// Docker re-derives the same image ID (`sha256` of the config) and
+    /// checks each layer against the config's `diff_ids`. It carries no
+    /// tag, so loading it never retags an existing image.
+    pub fn docker_load_manifest_json(&self) -> Result<Vec<u8>, StoreError> {
+        let doc: OciImageManifestDoc = serde_json::from_slice(&self.raw_manifest_bytes)
+            .map_err(|e| StoreError::InvalidFormat(format!("invalid OCI image manifest: {e}")))?;
+        let layers = doc
+            .layers
+            .iter()
+            .map(|l| {
+                Sha256Digest::from_oci_digest(&l.digest)
+                    .map(|d| format!("blobs/sha256/{}", d.to_hex()))
+                    .map_err(|e| StoreError::DigestMismatch(e.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        serde_json::to_vec(&serde_json::json!([{
+            "Config": format!("blobs/sha256/{}", self.verified_config_digest.to_hex()),
+            "RepoTags": [],
+            "Layers": layers,
+        }]))
+        .map_err(|e| StoreError::InvalidFormat(e.to_string()))
+    }
+}
+
 fn collect_regular_files_strict(
     root: &Path,
     cur: &Path,

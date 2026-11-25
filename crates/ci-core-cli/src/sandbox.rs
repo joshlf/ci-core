@@ -27,6 +27,8 @@ use rustix::system::uname;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
+use crate::ghcr::VerifiedOciLayout;
+
 /// Errors returned by sandbox setup, cache I/O, `cargo_locked` fetching, or
 /// output capture.
 #[derive(Debug, Error)]
@@ -1393,6 +1395,26 @@ pub fn run_cargo_locked_fetch_container(
     Ok(())
 }
 
+/// Writes the `docker load` input for a verified layout to `w`: every file
+/// under `layout_dir`, plus a synthesized `manifest.json` (see
+/// `VerifiedOciLayout::docker_load_manifest_json`). The on-disk layout is
+/// not modified, so it stays a pure OCI layout.
+pub fn write_docker_load_tar<W: Write>(
+    layout_dir: &Path,
+    docker_manifest_json: &[u8],
+    w: W,
+) -> std::io::Result<W> {
+    let mut tb = tar::Builder::new(w);
+    tb.follow_symlinks(false);
+    tb.append_dir_all(".", layout_dir)?;
+    let mut hdr = tar::Header::new_gnu();
+    hdr.set_size(docker_manifest_json.len() as u64);
+    hdr.set_mode(0o644);
+    hdr.set_cksum();
+    tb.append_data(&mut hdr, "manifest.json", docker_manifest_json)?;
+    tb.into_inner()
+}
+
 /// Loads a verified pure OCI layout directory into the local container store
 /// and returns the pinned `<loaded_image_id> = sha256:<verified_config_digest>`
 /// (`Obligation O6`).
@@ -1402,8 +1424,9 @@ pub fn run_cargo_locked_fetch_container(
 /// written to `/tmp`.
 pub fn docker_load_verified_oci_layout(
     layout_dir: &Path,
-    verified_config_digest: &Sha256Digest,
+    verified: &VerifiedOciLayout,
 ) -> Result<String, SandboxError> {
+    let verified_config_digest = &verified.verified_config_digest;
     let rt = ContainerRuntime::resolve()?;
     match rt {
         ContainerRuntime::Podman { ref bin, .. } => {
@@ -1422,6 +1445,9 @@ pub fn docker_load_verified_oci_layout(
             }
         }
         ContainerRuntime::Docker { ref bin } => {
+            let docker_manifest_json = verified
+                .docker_load_manifest_json()
+                .map_err(|e| SandboxError::Exec(format!("docker load manifest: {e}")))?;
             let mut child = Command::new(bin)
                 .arg("load")
                 .stdin(Stdio::piped())
@@ -1451,14 +1477,9 @@ pub fn docker_load_verified_oci_layout(
                 let _ = BufReader::new(stderr).read_to_end(&mut buf);
                 buf
             });
-            let stream_res = (|| -> std::io::Result<()> {
-                let mut tb = tar::Builder::new(BufWriter::new(stdin));
-                tb.follow_symlinks(false);
-                tb.append_dir_all(".", layout_dir)?;
-                tb.finish()?;
-                let mut w = tb.into_inner()?;
-                w.flush()
-            })();
+            let stream_res =
+                write_docker_load_tar(layout_dir, &docker_manifest_json, BufWriter::new(stdin))
+                    .and_then(|mut w| w.flush());
             let status = child
                 .wait()
                 .map_err(|e| SandboxError::Exec(format!("container load wait failed: {e}")))?;
