@@ -271,6 +271,12 @@ impl HardenedBareGit {
         }
     }
 
+    /// Returns `true` iff a remote is configured, so missing history can be
+    /// fetched.
+    pub const fn has_remote(&self) -> bool {
+        self.remote_url.is_some()
+    }
+
     /// Checks whether `oid` exists as a commit/object locally.
     pub fn object_exists(&self, oid: &GitOid) -> bool {
         self.run_local(&["cat-file", "-e", &format!("{oid}^{{commit}}")])

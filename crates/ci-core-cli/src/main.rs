@@ -377,6 +377,72 @@ fn resolve_live_cfg_for_event(
     }
 }
 
+/// Resolves the landed base `B` (`S_0`) of a `merge_group` chain.
+///
+/// GitHub sets `merge_group.base_sha` to the group's parent commit. For the
+/// entry at the head of the queue that parent is `H_default`, or an ancestor
+/// of it once later commits have landed. For an entry queued behind others,
+/// the parent is the previous entry's not-yet-landed commit, so `H_default`
+/// is instead a first-parent ancestor of the parent. In that case the chain
+/// starts at `H_default`, and the queued-ahead entries become chain steps that
+/// `evaluate_merge_group_tcb` attributes through merge-queue replay. Any other
+/// relationship fails closed.
+fn resolve_merge_group_base(
+    git: &HardenedBareGit,
+    mg_parent: &GitOid,
+    h_default_sha: &GitOid,
+) -> Result<GitOid, String> {
+    // Test both directions on local history first, and deepen both tips in
+    // lockstep only while neither holds, so a queued entry does not unshallow
+    // the default branch looking for an ancestry that runs the other way.
+    let mut depth = 32u32;
+    let queued_behind = loop {
+        if git.object_exists(mg_parent) && git.object_exists(h_default_sha) {
+            let (p, h) = (mg_parent.to_hex(), h_default_sha.to_hex());
+            if git.is_ancestor(&p, &h).map_err(|e| e.to_string())? {
+                break false;
+            }
+            if git.is_ancestor(&h, &p).map_err(|e| e.to_string())? {
+                break true;
+            }
+        }
+        if !git.has_remote() || depth > 65_536 {
+            return Err(format!(
+                "merge_group parent `{mg_parent}` and default branch `{h_default_sha}` are \
+                 unrelated"
+            ));
+        }
+        git.fetch_oid(mg_parent, depth).map_err(|e| e.to_string())?;
+        git.fetch_oid(h_default_sha, depth)
+            .map_err(|e| e.to_string())?;
+        depth = depth.saturating_mul(4);
+    };
+    if !queued_behind {
+        return Ok(*mg_parent);
+    }
+    let queued_ahead = git
+        .first_parent_chain(h_default_sha, mg_parent)
+        .map_err(|e| e.to_string())?;
+    let mut prev = *h_default_sha;
+    for c in &queued_ahead {
+        let parents = git.commit_parents(c).map_err(|e| e.to_string())?;
+        if parents.first() != Some(&prev) {
+            return Err(format!(
+                "default branch `{h_default_sha}` is not on the first-parent chain of \
+                 merge_group parent `{mg_parent}`"
+            ));
+        }
+        prev = *c;
+    }
+    if prev != *mg_parent {
+        return Err(format!(
+            "first-parent chain from `{h_default_sha}` does not end at merge_group parent \
+             `{mg_parent}`"
+        ));
+    }
+    Ok(*h_default_sha)
+}
+
 fn resolve_pr_tcb_base(
     git: &HardenedBareGit,
     eff_remote: Option<&str>,
@@ -903,16 +969,15 @@ fn cmd_plan(
                     "merge_group ref {runtime_ref:?} does not match {expected_prefix:?}"
                 ));
             }
-            let b_sha = GitOid::from_hex(
+            let mg_parent = GitOid::from_hex(
                 mg_base_sha_arg
                     .as_deref()
                     .ok_or_else(|| "merge_group requires --merge-group-base-sha".to_owned())?,
             )
             .map_err(|e| e.to_string())?;
-            git.ensure_ancestor_with_deepening(&b_sha, &event_sha.to_hex())
+            git.ensure_ancestor_with_deepening(&mg_parent, &event_sha.to_hex())
                 .map_err(|e| e.to_string())?;
-            git.ensure_ancestor_with_deepening(&b_sha, &h_default_sha.to_hex())
-                .map_err(|e| e.to_string())?;
+            let b_sha = resolve_merge_group_base(&git, &mg_parent, &h_default_sha)?;
 
             let b_tree =
                 BareGitTree::from_commit(git.clone(), &b_sha).map_err(|e| e.to_string())?;
@@ -3534,5 +3599,177 @@ mod cli_flag_sync_tests {
                 panic!("expected Gate");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod merge_group_base_tests {
+    use super::*;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn git(cwd: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    fn commit(repo: &Path, name: &str) -> GitOid {
+        std::fs::write(repo.join(name), name).unwrap();
+        git(repo, &["add", name]);
+        git(repo, &["commit", "-q", "-m", name]);
+        GitOid::from_hex(&git(repo, &["rev-parse", "HEAD"])).unwrap()
+    }
+
+    struct Fixture {
+        _td: tempfile::TempDir,
+        bare: HardenedBareGit,
+        landed: GitOid,
+        head: GitOid,
+        queued_1: GitOid,
+        queued_2: GitOid,
+        diverged: GitOid,
+        side_merge: GitOid,
+    }
+
+    // main:   root - landed - head
+    // queue:                  head - queued_1 - queued_2
+    // other:  root - diverged
+    // merge:  diverged + head (first parent `diverged`) = side_merge
+    fn fixture() -> Fixture {
+        let td = tempfile::tempdir().unwrap();
+        let repo = td.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        let root = commit(&repo, "root");
+        let landed = commit(&repo, "landed");
+        let head = commit(&repo, "head");
+        let queued_1 = commit(&repo, "queued-1");
+        let queued_2 = commit(&repo, "queued-2");
+        git(&repo, &["checkout", "-q", "-b", "other", &root.to_hex()]);
+        let diverged = commit(&repo, "diverged");
+        git(&repo, &["merge", "-q", "--no-edit", &head.to_hex()]);
+        let side_merge = GitOid::from_hex(&git(&repo, &["rev-parse", "HEAD"])).unwrap();
+        let bare = HardenedBareGit::open_existing(repo.join(".git")).unwrap();
+        Fixture {
+            _td: td,
+            bare,
+            landed,
+            head,
+            queued_1,
+            queued_2,
+            diverged,
+            side_merge,
+        }
+    }
+
+    #[test]
+    fn head_of_queue_parent_is_default_branch() {
+        let f = fixture();
+        assert_eq!(
+            resolve_merge_group_base(&f.bare, &f.head, &f.head).unwrap(),
+            f.head
+        );
+    }
+
+    #[test]
+    fn landed_parent_is_kept() {
+        let f = fixture();
+        assert_eq!(
+            resolve_merge_group_base(&f.bare, &f.landed, &f.head).unwrap(),
+            f.landed
+        );
+    }
+
+    #[test]
+    fn queued_parent_rebases_onto_default_branch() {
+        let f = fixture();
+        assert_eq!(
+            resolve_merge_group_base(&f.bare, &f.queued_1, &f.head).unwrap(),
+            f.head
+        );
+        assert_eq!(
+            resolve_merge_group_base(&f.bare, &f.queued_2, &f.head).unwrap(),
+            f.head
+        );
+    }
+
+    #[test]
+    fn unrelated_parent_fails_closed() {
+        let f = fixture();
+        let err = resolve_merge_group_base(&f.bare, &f.diverged, &f.head).unwrap_err();
+        assert!(err.contains("unrelated"), "{err}");
+    }
+
+    fn local_history_len(git_dir: &Path, tip: &GitOid) -> usize {
+        let out = git(
+            git_dir,
+            &["--git-dir", ".", "rev-list", "--count", &tip.to_hex()],
+        );
+        out.parse().unwrap()
+    }
+
+    // A queued entry must resolve from shallow fetches without deepening
+    // the default branch's history, and a landed parent must still resolve
+    // by deepening until its ancestry is visible.
+    #[test]
+    fn shallow_remote_resolution_deepens_only_as_needed() {
+        let td = tempfile::tempdir().unwrap();
+        let repo = td.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        for i in 0..60 {
+            commit(&repo, &format!("history-{i}"));
+        }
+        let landed = commit(&repo, "landed");
+        for i in 0..40 {
+            commit(&repo, &format!("after-landed-{i}"));
+        }
+        let head = commit(&repo, "head");
+        let _queued_1 = commit(&repo, "queued-1");
+        let queued_2 = commit(&repo, "queued-2");
+        let remote = format!("file://{}", repo.display());
+
+        let queued_dir = td.path().join("queued.git");
+        let bare = HardenedBareGit::init_bare(&queued_dir, Some(remote.clone()), None).unwrap();
+        bare.fetch_oid(&queued_2, 3).unwrap();
+        bare.fetch_oid(&head, 1).unwrap();
+        assert_eq!(
+            resolve_merge_group_base(&bare, &queued_2, &head).unwrap(),
+            head
+        );
+        assert_eq!(
+            local_history_len(&queued_dir, &queued_2),
+            3,
+            "must not deepen history"
+        );
+
+        let landed_dir = td.path().join("landed.git");
+        let bare = HardenedBareGit::init_bare(&landed_dir, Some(remote), None).unwrap();
+        bare.fetch_oid(&landed, 1).unwrap();
+        bare.fetch_oid(&head, 1).unwrap();
+        assert_eq!(
+            resolve_merge_group_base(&bare, &landed, &head).unwrap(),
+            landed
+        );
+    }
+
+    #[test]
+    fn default_branch_off_first_parent_chain_fails_closed() {
+        let f = fixture();
+        let err = resolve_merge_group_base(&f.bare, &f.side_merge, &f.head).unwrap_err();
+        assert!(err.contains("first-parent chain"), "{err}");
     }
 }
