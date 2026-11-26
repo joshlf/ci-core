@@ -23,10 +23,10 @@ permissions: {}
 
 env:
   # Release archive coordinates pinned atomically by Phase 2 of release.yml.
-  CORE_ARCHIVE_RELEASE_URL_X86_64: https://github.com/joshlf/ci-core/releases/download/v0.1.6/ci-core-x86_64-unknown-linux-musl.tar.zst
-  CORE_ARCHIVE_SHA256_X86_64: eb787d1c0de5a0e0397bc8cca18a7dac429e0943d0fd6735591723819b696f1f
-  CORE_ARCHIVE_RELEASE_URL_AARCH64: https://github.com/joshlf/ci-core/releases/download/v0.1.6/ci-core-aarch64-unknown-linux-musl.tar.zst
-  CORE_ARCHIVE_SHA256_AARCH64: bc2d1c5590981ee0d579fe38243eda2f31d33a493c9720de2206dabaed88ff60
+  CORE_ARCHIVE_RELEASE_URL_X86_64: https://github.com/joshlf/ci-core/releases/download/v0.1.7/ci-core-x86_64-unknown-linux-musl.tar.zst
+  CORE_ARCHIVE_SHA256_X86_64: f63b3b86eec2707833a4f01ea7de995483017a8dc14ef784e9610a1a4f72fa94
+  CORE_ARCHIVE_RELEASE_URL_AARCH64: https://github.com/joshlf/ci-core/releases/download/v0.1.7/ci-core-aarch64-unknown-linux-musl.tar.zst
+  CORE_ARCHIVE_SHA256_AARCH64: d5267c28dda8f2180f5e3aa729766106746d7944e3fb22cba2819779b067fb69
   CORE_ARCHIVE_GHCR_REPO: joshlf/ci-core/release-archive
 
 jobs:
