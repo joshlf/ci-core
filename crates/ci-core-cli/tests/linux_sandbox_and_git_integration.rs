@@ -172,6 +172,137 @@ fn bare_git_merge_tree_neutralizes_gitattributes_driver_rce_and_replays_slices()
     );
 }
 
+#[test]
+fn bare_git_fetch_ref_recovers_from_shallow_file_changed_race_and_disables_auto_gc() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if let Some(subproc_dir) = std::env::var_os("CI_CORE_TEST_SHIM_SUBPROC") {
+        let base = PathBuf::from(subproc_dir);
+        let src_repo = base.join("src_repo");
+        let stack_head = GitOid::from_hex(&git_cmd(&src_repo, &["rev-parse", "HEAD"])).unwrap();
+        let counter_file = base.join("fetch_count.txt");
+        let args_log = base.join("git_args.log");
+        let mode_file = base.join("shim_mode.txt");
+
+        // Case 1: Transient race succeeds on retry 2.
+        let bare1_dir = base.join("bare1.git");
+        let bare1 = HardenedBareGit::init_bare(
+            &bare1_dir,
+            Some(src_repo.to_str().unwrap().to_owned()),
+            None,
+        )
+        .unwrap();
+        let resolved1 = bare1
+            .fetch_ref("refs/heads/stack-base", "refs/ci-core/pr-base", 32)
+            .unwrap();
+        assert_eq!(resolved1, stack_head);
+        assert_eq!(fs::read_to_string(&counter_file).unwrap().trim(), "2");
+
+        let logged = fs::read_to_string(&args_log).unwrap();
+        assert!(logged.contains("gc.auto=0"), "missing gc.auto=0: {logged}");
+        assert!(
+            logged.contains("gc.autoDetach=false"),
+            "missing gc.autoDetach=false: {logged}"
+        );
+        assert!(
+            logged.contains("maintenance.auto=false"),
+            "missing maintenance.auto=false: {logged}"
+        );
+
+        // Case 2: Persistent `+src:dst` shallow-stat failure falls back to `ls-remote` + `fetch_oid` + `update-ref`.
+        fs::write(&mode_file, "always\n").unwrap();
+        fs::write(&counter_file, "0").unwrap();
+        let bare2_dir = base.join("bare2.git");
+        let bare2 = HardenedBareGit::init_bare(
+            &bare2_dir,
+            Some(src_repo.to_str().unwrap().to_owned()),
+            None,
+        )
+        .unwrap();
+        let resolved2 = bare2
+            .fetch_ref("refs/heads/stack-base", "refs/ci-core/pr-base", 32)
+            .unwrap();
+        assert_eq!(resolved2, stack_head);
+        assert!(bare2.object_exists(&stack_head));
+        assert_eq!(
+            fs::read_to_string(&counter_file).unwrap().trim(),
+            "4",
+            "expected initial attempt + 3 retries before ls-remote fallback"
+        );
+        let logged2 = fs::read_to_string(&args_log).unwrap();
+        assert!(
+            logged2.contains("ls-remote -- ") && logged2.contains("refs/heads/stack-base"),
+            "missing ls-remote fallback in git_args.log: {logged2}"
+        );
+        return;
+    }
+
+    let td = tempfile::tempdir().unwrap();
+    let src_repo = td.path().join("src_repo");
+    fs::create_dir_all(&src_repo).unwrap();
+    git_cmd(&src_repo, &["init", "-b", "main"]);
+    fs::write(src_repo.join("a.txt"), "base\n").unwrap();
+    git_cmd(&src_repo, &["add", "a.txt"]);
+    git_cmd(&src_repo, &["commit", "-m", "base"]);
+    git_cmd(&src_repo, &["checkout", "-b", "stack-base"]);
+    fs::write(src_repo.join("s.txt"), "stack\n").unwrap();
+    git_cmd(&src_repo, &["add", "s.txt"]);
+    git_cmd(&src_repo, &["commit", "-m", "stack-c1"]);
+
+    let real_git_out = Command::new("which").arg("git").output().unwrap();
+    assert!(real_git_out.status.success());
+    let real_git = String::from_utf8_lossy(&real_git_out.stdout)
+        .trim()
+        .to_owned();
+
+    let shim_dir = td.path().join("shim_bin");
+    fs::create_dir_all(&shim_dir).unwrap();
+    let counter_file = td.path().join("fetch_count.txt");
+    let args_log = td.path().join("git_args.log");
+    let mode_file = td.path().join("shim_mode.txt");
+    fs::write(&mode_file, "once\n").unwrap();
+
+    let shim_path = shim_dir.join("git");
+    let script = format!(
+        "#!/bin/sh\n\
+         printf '%s\\n' \"$*\" >> {args_log:?}\n\
+         case \"$*\" in\n\
+           *\"fetch \"*\"+refs/heads/stack-base:refs/ci-core/pr-base\"*)\n\
+             mode=$(cat {mode_file:?})\n\
+             cnt=0\n\
+             if [ -f {counter_file:?} ]; then cnt=$(cat {counter_file:?}); fi\n\
+             cnt=$((cnt + 1))\n\
+             printf '%s' \"$cnt\" > {counter_file:?}\n\
+             if [ \"$mode\" = \"always\" ] || [ \"$cnt\" -eq 1 ]; then\n\
+               echo 'fatal: shallow file has changed since we read it' >&2\n\
+               exit 128\n\
+             fi\n\
+             ;;\n\
+         esac\n\
+         exec {real_git:?} \"$@\"\n"
+    );
+    fs::write(&shim_path, script).unwrap();
+    fs::set_permissions(&shim_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let orig_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{orig_path}", shim_dir.display());
+    let child_out = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("bare_git_fetch_ref_recovers_from_shallow_file_changed_race_and_disables_auto_gc")
+        .arg("--nocapture")
+        .env("CI_CORE_TEST_SHIM_SUBPROC", td.path())
+        .env("LC_ALL", "fr_FR.UTF-8")
+        .env("PATH", &new_path)
+        .output()
+        .unwrap();
+    assert!(
+        child_out.status.success(),
+        "subproc test failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&child_out.stdout),
+        String::from_utf8_lossy(&child_out.stderr)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 2. Obligation O6: Pure OCI Layout Verification & Hybrid Rejection
 // ---------------------------------------------------------------------------
