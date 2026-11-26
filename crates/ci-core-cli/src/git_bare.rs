@@ -136,6 +136,12 @@ impl HardenedBareGit {
                 "-c",
                 "core.autocrlf=false",
                 "-c",
+                "gc.auto=0",
+                "-c",
+                "gc.autoDetach=false",
+                "-c",
+                "maintenance.auto=false",
+                "-c",
                 "diff.external=",
                 "-c",
                 "protocol.ext.allow=never",
@@ -161,6 +167,58 @@ impl HardenedBareGit {
         Ok(out.stdout)
     }
 
+    fn is_transient_shallow_race(stderr: &str) -> bool {
+        stderr.contains("shallow file has changed since we read it")
+            || (stderr.contains("shallow.lock") && stderr.contains("Unable to create"))
+    }
+
+    fn auth_header_arg(&self, remote: &str) -> Option<String> {
+        self.auth_token
+            .as_deref()
+            .filter(|tok| !tok.is_empty() && remote.starts_with("https://github.com/"))
+            .map(|tok| {
+                let basic = base64::engine::general_purpose::STANDARD
+                    .encode(format!("x-access-token:{tok}"));
+                format!("http.https://github.com/.extraheader=AUTHORIZATION: basic {basic}")
+            })
+    }
+
+    fn resolve_remote_ref_oid(&self, remote_ref: &str) -> Result<GitOid, GitError> {
+        let remote = self
+            .remote_url
+            .as_deref()
+            .ok_or_else(|| GitError::Command {
+                cmd: "git ls-remote".to_owned(),
+                reason: "no remote_url configured on HardenedBareGit".to_owned(),
+            })?;
+        let mut cmd = Self::base_command(&self.git_dir);
+        if let Some(hdr) = self.auth_header_arg(remote) {
+            cmd.args(["-c", &hdr]);
+        }
+        cmd.args(["ls-remote", "--", remote, remote_ref]);
+        let out = cmd.output().map_err(|e| GitError::Command {
+            cmd: format!("git ls-remote {remote_ref}"),
+            reason: e.to_string(),
+        })?;
+        if !out.status.success() {
+            return Err(GitError::Command {
+                cmd: format!("git ls-remote {remote_ref}"),
+                reason: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+            });
+        }
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if let Some((hex, rname)) = line.trim().split_once('\t')
+                && rname == remote_ref
+            {
+                return GitOid::from_hex(hex).map_err(|e| GitError::Parse(e.to_string()));
+            }
+        }
+        Err(GitError::Command {
+            cmd: format!("git ls-remote {remote_ref}"),
+            reason: format!("remote ref `{remote_ref}` not found"),
+        })
+    }
+
     fn run_network_fetch(&self, refspec: &str, depth: Option<u32>) -> Result<(), GitError> {
         let remote = self
             .remote_url
@@ -169,34 +227,47 @@ impl HardenedBareGit {
                 cmd: "git fetch".to_owned(),
                 reason: "no remote_url configured on HardenedBareGit".to_owned(),
             })?;
-        let mut cmd = Self::base_command(&self.git_dir);
-        if let Some(ref tok) = self.auth_token
-            && !tok.is_empty()
-            && remote.starts_with("https://github.com/")
+        let basic_header = self.auth_header_arg(remote);
+
+        const BACKOFF_MS: [u64; 3] = [50, 150, 400];
+        let mut last_reason = String::new();
+        for delay_ms in BACKOFF_MS
+            .iter()
+            .copied()
+            .map(Some)
+            .chain(std::iter::once(None))
         {
-            let basic =
-                base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{tok}"));
-            cmd.args([
-                "-c",
-                &format!("http.https://github.com/.extraheader=AUTHORIZATION: basic {basic}"),
-            ]);
-        }
-        cmd.args(["fetch", "--no-tags", "--no-recurse-submodules"]);
-        if let Some(d) = depth {
-            cmd.arg(format!("--depth={d}"));
-        }
-        cmd.args([remote, refspec]);
-        let out = cmd.output().map_err(|e| GitError::Command {
-            cmd: format!("git fetch {refspec}"),
-            reason: e.to_string(),
-        })?;
-        if !out.status.success() {
-            return Err(GitError::Command {
+            let mut cmd = Self::base_command(&self.git_dir);
+            cmd.env("LC_ALL", "C");
+            cmd.env("LC_MESSAGES", "C");
+            if let Some(ref hdr) = basic_header {
+                cmd.args(["-c", hdr]);
+            }
+            cmd.args(["fetch", "--no-tags", "--no-recurse-submodules"]);
+            if let Some(d) = depth {
+                cmd.arg(format!("--depth={d}"));
+            }
+            cmd.args([remote, refspec]);
+            let out = cmd.output().map_err(|e| GitError::Command {
                 cmd: format!("git fetch {refspec}"),
-                reason: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
-            });
+                reason: e.to_string(),
+            })?;
+            if out.status.success() {
+                return Ok(());
+            }
+            last_reason = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+            if let Some(ms) = delay_ms
+                && Self::is_transient_shallow_race(&last_reason)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                continue;
+            }
+            break;
         }
-        Ok(())
+        Err(GitError::Command {
+            cmd: format!("git fetch {refspec}"),
+            reason: last_reason,
+        })
     }
 
     /// Fetches an immutable commit OID with optional shallow `depth`.
@@ -213,8 +284,23 @@ impl HardenedBareGit {
         depth: u32,
     ) -> Result<GitOid, GitError> {
         let spec = format!("+{remote_ref}:{local_ref}");
-        self.run_network_fetch(&spec, Some(depth))?;
-        self.rev_parse_oid(local_ref)
+        match self.run_network_fetch(&spec, Some(depth)) {
+            Ok(()) => self.rev_parse_oid(local_ref),
+            Err(GitError::Command { ref reason, .. })
+                if Self::is_transient_shallow_race(reason) =>
+            {
+                // Git's smart-HTTP `fetch-pack` child can update `$GIT_DIR/shallow`
+                // before parent `git fetch` validates `shallow_stat` for `+src:dst`
+                // ref updates on stacked shallow repos. Fallback to `ls-remote` +
+                // refspec-free `fetch_oid` + `update-ref` avoids `store_updated_refs`
+                // shallow re-stat failure while preserving exact ref resolution.
+                let oid = self.resolve_remote_ref_oid(remote_ref)?;
+                self.fetch_oid(&oid, depth)?;
+                self.run_local(&["update-ref", local_ref, &oid.to_hex()])?;
+                self.rev_parse_oid(local_ref)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Iteratively deepens `tip` until `ancestor` is present and verified via
